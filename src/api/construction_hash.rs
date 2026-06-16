@@ -7,7 +7,8 @@ use mina_p2p_messages::{
     CurrencyAmountStableV1, CurrencyFeeStableV1, MinaBasePaymentPayloadStableV2, MinaBaseSignatureStableV1,
     MinaBaseSignedCommandMemoStableV1, MinaBaseSignedCommandPayloadBodyStableV2,
     MinaBaseSignedCommandPayloadCommonStableV2, MinaBaseSignedCommandPayloadStableV2, MinaBaseSignedCommandStableV2,
-    MinaBaseStakeDelegationStableV2, MinaNumbersGlobalSlotSinceGenesisMStableV1, NonZeroCurvePoint,
+    MinaBaseStakeDelegationStableV2, MinaBaseUserCommandStableV2, MinaNumbersGlobalSlotSinceGenesisMStableV1,
+    NonZeroCurvePoint,
     NonZeroCurvePointUncompressedStableV1, UnsignedExtendedUInt32StableV1,
     UnsignedExtendedUInt64Int64ForVersionTagsStableV1,
   },
@@ -55,6 +56,42 @@ impl MinaMesh {
     let hash = mina_base_signed.hash().map_err(|e| MinaMeshError::Exception(e.to_string()))?;
 
     Ok(TransactionIdentifierResponse::new(TransactionIdentifier::new(hash.to_string())))
+  }
+
+  /// Build the on-wire signed user command from a parsed signed transaction — the same
+  /// `MinaBaseSignedCommandStableV2` [`construction_hash`](Self::construction_hash)
+  /// builds for hashing, but carrying the **real** decoded signature, wrapped as a
+  /// [`MinaBaseUserCommandStableV2`]. Its binprot serialization is exactly what the
+  /// tx-pool gossip topic expects, so it can be broadcast peer-to-peer via the light
+  /// node instead of submitted to a trusted daemon.
+  pub(crate) fn signed_user_command(
+    &self,
+    tx: &TransactionSigned,
+  ) -> Result<MinaBaseUserCommandStableV2, MinaMeshError> {
+    self.check_transaction(tx)?;
+    let signature = decode_signature(&tx.signature)?;
+    let signer_pk = self.extract_signer(tx)?;
+    let signer = non_zero_curve_point_from_compressed(signer_pk.into_compressed());
+
+    let user_command_payload = if let Some(payment) = &tx.payment {
+      let operations = generate_operations_user_command(payment);
+      self.validate_operations(tx, &operations, payment.valid_until, payment.memo.clone())?
+    } else if let Some(stake_delegation) = &tx.stake_delegation {
+      let operations = generate_operations_user_command(stake_delegation);
+      self.validate_operations(tx, &operations, stake_delegation.valid_until, stake_delegation.memo.clone())?
+    } else {
+      return Err(MinaMeshError::JsonParse(Some(
+        "Signed transaction must have one of: payment, stake_delegation".to_string(),
+      )));
+    };
+
+    let signature = MinaBaseSignatureStableV1(
+      BigInt::from(signature.rx.into_repr()),
+      BigInt::from(signature.s.into_repr()),
+    );
+    let signed =
+      MinaBaseSignedCommandStableV2 { payload: user_command_payload.into(), signer, signature: signature.into() };
+    Ok(MinaBaseUserCommandStableV2::SignedCommand(signed))
   }
 
   /// Extract and decompress the signer from the transaction.

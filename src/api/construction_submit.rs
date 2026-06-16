@@ -1,6 +1,7 @@
 use anyhow::Result;
 use coinbase_mesh::models::{ConstructionSubmitRequest, TransactionIdentifier};
 use cynic::MutationBuilder;
+use mina_p2p_messages::binprot::BinProtWrite;
 
 use crate::{
   graphql::{SendDelegation, SendDelegationVariables, SendPayment, SendPaymentVariables},
@@ -20,6 +21,21 @@ impl MinaMesh {
       return Err(MinaMeshError::JsonParse(Some(
         "Signed transaction must have one of: payment, stake_delegation".to_string(),
       )));
+    }
+
+    // Trustless backend: broadcast the signed command peer-to-peer via the light node
+    // (no trusted daemon). Same signed transaction, different delivery — the canonical
+    // tx hash is identical to the daemon path's (it excludes the signature).
+    if let Some(light_node) = &self.light_node {
+      let user_command = self.signed_user_command(&signed_transaction)?;
+      let mut bytes = Vec::new();
+      user_command
+        .binprot_write(&mut bytes)
+        .map_err(|e| MinaMeshError::Exception(format!("binprot encode user command: {e}")))?;
+      let outcome = light_node.submit(&hex::encode(bytes)).await?;
+      self.cache_transaction(&signed_transaction.signature);
+      tracing::info!("Broadcast via light node; tx hash: {}", outcome.tx_id);
+      return Ok(TransactionIdentifier::new(outcome.tx_id));
     }
 
     // tracing::debug!("CACHE: {:?}", self.cache);
