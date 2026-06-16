@@ -84,10 +84,10 @@ impl LightNodeClient {
     self.get_json("/mempool").await
   }
 
-  /// Proof-anchored balance + nonce for the account at `index` (untrusted hint), with
-  /// `pubkey` cross-checked by the light node against the proved account.
-  pub async fn account(&self, pubkey: &str, index: u64) -> Result<LightAccount, MinaMeshError> {
-    self.get_json(&format!("/account?pubkey={pubkey}&index={index}")).await
+  /// Proof-anchored balance + nonce for `pubkey`. The light node resolves the leaf index
+  /// from its own swept map and Merkle-proves the account against the verified epoch root.
+  pub async fn account(&self, pubkey: &str) -> Result<LightAccount, MinaMeshError> {
+    self.get_json(&format!("/account?pubkey={pubkey}")).await
   }
 
   /// Broadcast a signed `MinaBaseUserCommandStableV2` (hex binprot) to the tx-pool

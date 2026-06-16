@@ -105,6 +105,34 @@ impl MinaMesh {
   }
 
   async fn frontier_balance(&self, public_key: String) -> Result<AccountBalanceResponse, MinaMeshError> {
+    // Trustless backend: Merkle-proved balance/nonce from the light node. NB this is the
+    // finalized *epoch-ledger* balance (what peers serve), anchored to the verified tip —
+    // not the staged-tip balance. Marked in metadata; no vesting split is available.
+    if let Some(light_node) = &self.light_node {
+      let acct = light_node.account(&public_key).await?;
+      return Ok(AccountBalanceResponse {
+        block_identifier: Box::new(BlockIdentifier {
+          hash: acct.anchored_state_hash,
+          index: acct.anchored_height as i64,
+        }),
+        balances: vec![Amount {
+          currency: Box::new(create_currency(None)),
+          value: acct.balance.to_string(),
+          metadata: Some(serde_json::json!({
+            "locked_balance": 0,
+            "liquid_balance": acct.balance,
+            "total_balance": acct.balance
+          })),
+        }],
+        metadata: Some(serde_json::json!({
+          "created_via_historical_lookup": false,
+          "nonce": acct.nonce.to_string(),
+          "trustless": true,
+          "ledger": acct.ledger
+        })),
+      });
+    }
+
     let result = self
       .graphql_client
       .send(QueryBalance::build(QueryBalanceVariables { public_key: public_key.clone().into() }))
