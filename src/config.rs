@@ -38,6 +38,12 @@ pub struct MinaMeshConfig {
   /// command.
   #[arg(long, env = "USE_SEARCH_TX_OPTIMIZATIONS", default_value = "false")]
   pub use_search_tx_optimizations: bool,
+
+  /// Optional URL of a trustless `mina-light-node-server`. When set, live-state
+  /// endpoints (mempool, frontier balance, submit) are served from the light node
+  /// (proof-anchored reads, peer-to-peer submit) instead of the GraphQL daemon.
+  #[arg(long, env = "MINAMESH_LIGHT_NODE_URL")]
+  pub light_node_url: Option<String>,
 }
 
 impl MinaMeshConfig {
@@ -57,6 +63,10 @@ impl MinaMeshConfig {
       return Err(MinaMeshError::GraphqlUriNotSet);
     }
     tracing::info!("Connecting to Mina GraphQL endpoint at {}", self.proxy_url);
+    let light_node = self.light_node_url.as_ref().map(|url| {
+      tracing::info!("Trustless light-node backend enabled at {url}");
+      crate::LightNodeClient::new(url.to_owned())
+    });
     let graphql_client = GraphQLClient::new(self.proxy_url.to_owned());
     let res = graphql_client.send(graphql::QueryGenesisBlockIdentifier::build(())).await?;
     let block_height = res.genesis_block.protocol_state.consensus_state.block_height.0.parse::<i64>()?;
@@ -77,6 +87,7 @@ impl MinaMeshConfig {
       cache: DashMap::new(),
       cache_ttl: Duration::from_secs(300),
       cache_tx_size: 100, // Cache limit for last n transactions submitted
+      light_node,
     })
   }
 }

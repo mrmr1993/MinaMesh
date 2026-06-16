@@ -12,6 +12,13 @@ use crate::{graphql::QueryMempool, MinaMesh};
 impl MinaMesh {
   pub async fn mempool(&self, req: NetworkRequest) -> Result<MempoolResponse> {
     self.validate_network(&req.network_identifier).await?;
+    // Trustless backend: serve the mempool from the light node's gossip tap (still
+    // best-effort — pending txs aren't proven — but no trusted daemon gatekeeper).
+    if let Some(light_node) = &self.light_node {
+      let view = light_node.mempool().await?;
+      let hashes = view.transaction_ids.into_iter().map(TransactionIdentifier::new).collect();
+      return Ok(MempoolResponse::new(hashes));
+    }
     let QueryMempool { daemon_status: _0, initial_peers: _1, pooled_user_commands } =
       self.graphql_client.send(QueryMempool::build(())).await?;
     let hashes = pooled_user_commands
