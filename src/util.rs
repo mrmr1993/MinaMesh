@@ -29,7 +29,11 @@ impl Wrapper<Option<serde_json::Value>> {
     match &self.0 {
       None => Ok(DEFAULT_TOKEN_ID.to_string()),
       Some(serde_json::Value::Object(map)) => {
-        Ok(map.get("token_id").map(|v| v.to_string()).unwrap_or(DEFAULT_TOKEN_ID.to_string()))
+        // Use as_str(), NOT to_string(): Value::to_string() re-serializes a JSON string *with*
+        // its surrounding quotes (`"wSHV2…"`), which never matches the archive's unquoted token
+        // value and silently yields a 0 balance. Any Rosetta client that sends token_id
+        // (rosetta-cli / mesh-cli always do) would otherwise fail every balance reconciliation.
+        Ok(map.get("token_id").and_then(|v| v.as_str()).map(str::to_string).unwrap_or(DEFAULT_TOKEN_ID.to_string()))
       }
       _ => Err(MinaMeshError::JsonParse(None))?,
     }
