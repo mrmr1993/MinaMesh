@@ -29,9 +29,15 @@ impl Memo {
     Ok(Self(memo_bytes))
   }
 
-  /// Creates an empty memo (all zeros)
+  /// Creates an empty memo. This MUST equal `from_string("")` — the canonical Mina empty memo
+  /// is the bytes-kind tag with length 0, not all-zeros. An all-zeros memo (tag 0x00) hashes
+  /// differently from `from_string("")` (tag BYTES_TAG) even though both render as "", which
+  /// breaks the /construction/payloads → /construction/parse round-trip for every memo-less
+  /// transaction (the random oracle input mismatches while the rendered memo matches).
   pub fn empty() -> Self {
-    Self([0u8; MEMO_LENGTH])
+    let mut memo_bytes = [0u8; MEMO_LENGTH];
+    memo_bytes[TAG_INDEX] = BYTES_TAG;
+    Self(memo_bytes)
   }
 
   /// Converts the memo to a string (ignoring trailing zeros)

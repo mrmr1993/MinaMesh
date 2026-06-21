@@ -1,5 +1,5 @@
 use anyhow::Result;
-use coinbase_mesh::models::{ConstructionSubmitRequest, TransactionIdentifier};
+use coinbase_mesh::models::{ConstructionSubmitRequest, TransactionIdentifier, TransactionIdentifierResponse};
 use cynic::MutationBuilder;
 use mina_p2p_messages::binprot::BinProtWrite;
 
@@ -13,7 +13,7 @@ impl MinaMesh {
   pub async fn construction_submit(
     &self,
     request: ConstructionSubmitRequest,
-  ) -> Result<TransactionIdentifier, MinaMeshError> {
+  ) -> Result<TransactionIdentifierResponse, MinaMeshError> {
     self.validate_network(&request.network_identifier).await?;
 
     let signed_transaction = TransactionSigned::from_json_string(&request.signed_transaction)?;
@@ -35,7 +35,7 @@ impl MinaMesh {
       let outcome = light_node.submit(&hex::encode(bytes)).await?;
       self.cache_transaction(&signed_transaction.signature);
       tracing::info!("Broadcast via light node; tx hash: {}", outcome.tx_id);
-      return Ok(TransactionIdentifier::new(outcome.tx_id));
+      return Ok(TransactionIdentifierResponse::new(TransactionIdentifier::new(outcome.tx_id)));
     }
 
     // tracing::debug!("CACHE: {:?}", self.cache);
@@ -45,7 +45,7 @@ impl MinaMesh {
       let hash = self.send_payment(payment, &signed_transaction.signature).await?;
       self.cache_transaction(&signed_transaction.signature);
       tracing::info!("Success! Transaction hash: {}", hash);
-      Ok(TransactionIdentifier::new(hash))
+      Ok(TransactionIdentifierResponse::new(TransactionIdentifier::new(hash)))
     } else if signed_transaction.stake_delegation.is_some() {
       tracing::info!("Stake delegation transaction");
       let delegation = signed_transaction.stake_delegation.unwrap();
@@ -53,7 +53,7 @@ impl MinaMesh {
       self.cache_transaction(&signed_transaction.signature);
       tracing::info!("Success! Transaction hash: {}", hash);
 
-      Ok(TransactionIdentifier::new(hash.to_string()))
+      Ok(TransactionIdentifierResponse::new(TransactionIdentifier::new(hash.to_string())))
     } else {
       tracing::debug!("Signed transaction missing payment or stake delegation");
       return Err(MinaMeshError::JsonParse(Some("Signed transaction missing payment or stake delegation".to_string())));
