@@ -13,6 +13,9 @@ use crate::{
   TransactionStatus, UserCommandMetadata, UserCommandType, ZkAppCommand,
 };
 
+/// The Mina account-creation fee (nanomina) — a protocol constant (1 MINA) on these networks.
+const ACCOUNT_CREATION_FEE: u64 = 1_000_000_000;
+
 /// https://github.com/MinaProtocol/mina/blob/985eda49bdfabc046ef9001d3c406e688bc7ec45/src/app/rosetta/lib/block.ml#L7
 impl MinaMesh {
   pub async fn block(&self, request: BlockRequest) -> Result<BlockResponse, MinaMeshError> {
@@ -108,7 +111,9 @@ impl MinaMesh {
         receiver: uc.to.clone().unwrap_or_default(),
         status: if uc.is_applied { TransactionStatus::Applied } else { TransactionStatus::Failed },
         failure_reason: uc.failure_reason.clone(),
-        creation_fee: None,
+        // 1 MINA account-creation fee when this payment created the receiver (matches the
+        // Postgres `accounts_created` attribution; the generator negates it on the receiver).
+        creation_fee: uc.receiver_account_creation_fee_paid.then(|| ACCOUNT_CREATION_FEE.to_string()),
       };
       transactions.push(Transaction {
         transaction_identifier: Box::new(TransactionIdentifier::new(meta.hash.clone())),
@@ -127,7 +132,10 @@ impl MinaMesh {
           receiver: receiver.clone(),
           fee: Some(ix.transactions.coinbase.clone()),
           hash: ix.state_hash.clone(),
-          creation_fee: None,
+          creation_fee: ix
+            .transactions
+            .coinbase_receiver_account_creation_fee_paid
+            .then(|| ACCOUNT_CREATION_FEE.to_string()),
           sequence_no: seq,
           secondary_sequence_no: 0,
           status: TransactionStatus::Applied,

@@ -410,7 +410,7 @@ fn ix_search_to_block_transaction(tx: &IxSearchTxn, include_timestamp: bool) -> 
     receiver: tx.to.clone().unwrap_or_default(),
     status: if tx.is_applied { TransactionStatus::Applied } else { TransactionStatus::Failed },
     failure_reason: tx.failure_reason.clone(),
-    creation_fee: None,
+    creation_fee: tx.receiver_account_creation_fee_paid.then(|| 1_000_000_000u64.to_string()),
   };
   let transaction = Transaction {
     transaction_identifier: Box::new(TransactionIdentifier::new(tx.hash.clone())),

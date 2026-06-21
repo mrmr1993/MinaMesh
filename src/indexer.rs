@@ -103,6 +103,9 @@ pub struct IxBlockTxns {
   /// Coinbase amount (nanomina, as a string; "0" when none).
   pub coinbase: String,
   pub coinbase_receiver: Option<String>,
+  /// Whether the coinbase credited a brand-new account (the receiver paid a creation fee).
+  #[serde(rename = "coinbase_receiver_account_creation_fee_paid", default)]
+  pub coinbase_receiver_account_creation_fee_paid: bool,
   #[serde(default)]
   pub fee_transfer: Vec<IxFeeTransfer>,
   #[serde(default)]
@@ -134,6 +137,9 @@ pub struct IxUserCommand {
   pub kind: String,
   pub failure_reason: Option<String>,
   pub is_applied: bool,
+  /// Whether this command paid the receiver's account-creation fee (new account).
+  #[serde(rename = "receiver_account_creation_fee_paid", default)]
+  pub receiver_account_creation_fee_paid: bool,
 }
 
 /// A user command with its containing-block context — the shape `search/transactions`
@@ -154,6 +160,8 @@ pub struct IxSearchTxn {
   pub canonical: bool,
   pub block_height: u32,
   pub block: IxTxnBlock,
+  #[serde(rename = "receiver_account_creation_fee_paid", default)]
+  pub receiver_account_creation_fee_paid: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -258,9 +266,9 @@ impl IndexerClient {
         creatorAccount {{ publicKey }}
         protocolState {{ previousStateHash blockchainState {{ utcDate }} }}
         transactions {{
-          coinbase coinbaseReceiver
+          coinbase coinbaseReceiver coinbase_receiver_account_creation_fee_paid
           feeTransfer {{ fee recipient type }}
-          userCommands {{ amount fee from to nonce memo hash kind failureReason isApplied }}
+          userCommands {{ amount fee from to nonce memo hash kind failureReason isApplied receiver_account_creation_fee_paid }}
         }}
       }} }}"#
     );
@@ -312,7 +320,7 @@ impl IndexerClient {
     let q = format!(
       r#"query {{ transactions(query: {{ {dir}: {}{height_filter} }}, limit: {limit}, sortBy: BLOCKHEIGHT_DESC) {{
         amount fee from to nonce memo hash kind failureReason isApplied canonical blockHeight
-        block {{ stateHash dateTime }}
+        receiver_account_creation_fee_paid block {{ stateHash dateTime }}
       }} }}"#,
       Self::lit(public_key)
     );
@@ -345,7 +353,7 @@ impl IndexerClient {
     let q = format!(
       r#"query {{ transactions(query: {{ hash: {} }}, limit: 1) {{
         amount fee from to nonce memo hash kind failureReason isApplied canonical blockHeight
-        block {{ stateHash dateTime }}
+        receiver_account_creation_fee_paid block {{ stateHash dateTime }}
       }} }}"#,
       Self::lit(hash)
     );
