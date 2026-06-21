@@ -34,6 +34,9 @@ pub use types::*;
 #[derive(Debug)]
 pub struct MinaMesh {
   pub graphql_client: GraphQLClient,
+  /// The Rosetta network id this server serves, `mina:<network>`. In trustless mode it's the
+  /// source of truth for network validation / `/network/list` (no daemon query needed).
+  pub network_id: String,
   /// Archive Postgres. `None` when the trustless [`IndexerClient`] backs historical reads.
   pub pg_pool: Option<PgPool>,
   pub genesis_block_identifier: BlockIdentifier,

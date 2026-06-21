@@ -1,6 +1,6 @@
 // TODO: get genesis block identifier from env
 
-use coinbase_mesh::models::{BlockIdentifier, NetworkRequest, NetworkStatusResponse, Peer};
+use coinbase_mesh::models::{BlockIdentifier, NetworkRequest, NetworkStatusResponse, Peer, SyncStatus};
 use cynic::QueryBuilder;
 
 use crate::{
@@ -12,6 +12,36 @@ use crate::{
 impl MinaMesh {
   pub async fn network_status(&self, req: NetworkRequest) -> Result<NetworkStatusResponse, MinaMeshError> {
     self.validate_network(&req.network_identifier).await?;
+
+    // Trustless mode: current tip + oldest from the indexer; sync target from the light
+    // node's verified network tip. No Mina daemon GraphQL.
+    if let Some(indexer) = &self.indexer {
+      let tip = indexer.tip().await?;
+      let oldest = indexer.oldest().await?;
+      let current_index = tip.block_height as i64;
+      // Sync target = the light node's proof-verified network tip (if configured). While the
+      // indexer backfills, current < target ⇒ not yet synced.
+      let target_index = match &self.light_node {
+        Some(ln) => ln.tip().await.map(|t| t.height as i64).unwrap_or(current_index),
+        None => current_index,
+      };
+      let synced = current_index >= target_index - 2;
+      return Ok(NetworkStatusResponse {
+        // The light node holds a peer mesh but exposes only a count, not Rosetta Peer ids.
+        peers: Some(vec![]),
+        current_block_identifier: Box::new(BlockIdentifier::new(current_index, tip.state_hash)),
+        current_block_timestamp: tip.protocol_state.blockchain_state.utc_date.parse::<i64>()?,
+        genesis_block_identifier: Box::new(self.genesis_block_identifier.clone()),
+        oldest_block_identifier: Some(Box::new(BlockIdentifier::new(oldest.block_height as i64, oldest.state_hash))),
+        sync_status: Some(Box::new(SyncStatus {
+          current_index: Some(current_index),
+          target_index: Some(target_index),
+          stage: Some(if synced { "Synced".to_string() } else { "Catchup".to_string() }),
+          synced: Some(synced),
+        })),
+      });
+    }
+
     let QueryNetworkStatus { best_chain, daemon_status: DaemonStatus3 { peers }, sync_status } =
       self.graphql_client.send(QueryNetworkStatus::build(())).await?;
     let blocks = best_chain.ok_or(MinaMeshError::ChainInfoMissing)?;

@@ -52,6 +52,12 @@ pub struct MinaMeshConfig {
   /// a Postgres archive. See [`crate::IndexerClient`].
   #[arg(long, env = "MINAMESH_INDEXER_URL")]
   pub indexer_url: Option<String>,
+
+  /// Network name (e.g. `devnet`, `mainnet`). In trustless mode (indexer set) this is the
+  /// source of truth for `/network/list` + network validation and the genesis identifier is
+  /// taken from the indexer — so no Mina daemon GraphQL (`proxy_url`) is needed at all.
+  #[arg(long, env = "MINAMESH_NETWORK", default_value = "devnet")]
+  pub network: String,
 }
 
 impl MinaMeshConfig {
@@ -67,10 +73,6 @@ impl MinaMeshConfig {
   }
 
   pub async fn to_mina_mesh(self) -> Result<MinaMesh, MinaMeshError> {
-    if self.proxy_url.is_empty() {
-      return Err(MinaMeshError::GraphqlUriNotSet);
-    }
-    tracing::info!("Connecting to Mina GraphQL endpoint at {}", self.proxy_url);
     let light_node = self.light_node_url.as_ref().map(|url| {
       tracing::info!("Trustless light-node backend enabled at {url}");
       crate::LightNodeClient::new(url.to_owned())
@@ -96,17 +98,47 @@ impl MinaMeshConfig {
       ),
       None => None,
     };
+    // `mina:<network>` — the Rosetta network id this server validates against.
+    let network_id = format!("mina:{}", self.network);
     let graphql_client = GraphQLClient::new(self.proxy_url.to_owned());
-    let res = graphql_client.send(graphql::QueryGenesisBlockIdentifier::build(())).await?;
-    let block_height = res.genesis_block.protocol_state.consensus_state.block_height.0.parse::<i64>()?;
-    let state_hash = res.genesis_block.state_hash.0.clone();
-    tracing::debug!("Genesis block identifier: {}", block_height);
-    tracing::debug!("Genesis block state hash: {}", state_hash);
+
+    // Genesis identifier: from the indexer in trustless mode (no daemon), else the daemon.
+    let genesis_block_identifier = if let Some(indexer) = &indexer {
+      // The indexer may still be starting; retry briefly for its rooted genesis (oldest).
+      let mut last = None;
+      let mut found = None;
+      for _ in 0..30 {
+        match indexer.oldest().await {
+          Ok(g) => {
+            found = Some(BlockIdentifier::new(g.block_height as i64, g.state_hash));
+            break;
+          }
+          Err(e) => {
+            last = Some(e);
+            tokio::time::sleep(Duration::from_secs(2)).await;
+          }
+        }
+      }
+      found.ok_or_else(|| {
+        MinaMeshError::Exception(format!("indexer not reachable for genesis identifier: {last:?}"))
+      })?
+    } else {
+      if self.proxy_url.is_empty() {
+        return Err(MinaMeshError::GraphqlUriNotSet);
+      }
+      tracing::info!("Connecting to Mina GraphQL endpoint at {}", self.proxy_url);
+      let res = graphql_client.send(graphql::QueryGenesisBlockIdentifier::build(())).await?;
+      let block_height = res.genesis_block.protocol_state.consensus_state.block_height.0.parse::<i64>()?;
+      let state_hash = res.genesis_block.state_hash.0.clone();
+      BlockIdentifier::new(block_height, state_hash)
+    };
+    tracing::info!("network {network_id}, genesis {genesis_block_identifier:?}");
 
     Ok(MinaMesh {
       graphql_client,
+      network_id,
       pg_pool,
-      genesis_block_identifier: BlockIdentifier::new(block_height, state_hash),
+      genesis_block_identifier,
       search_tx_optimized: self.use_search_tx_optimizations,
       cache: DashMap::new(),
       cache_ttl: Duration::from_secs(300),

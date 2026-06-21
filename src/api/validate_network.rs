@@ -8,6 +8,11 @@ impl MinaMesh {
   // Validate that the network identifier matches the network id of the GraphQL
   // server
   pub async fn validate_network(&self, network_identifier: &NetworkIdentifier) -> Result<(), MinaMeshError> {
+    // Trustless mode: validate against the configured network id — no daemon dependency.
+    if self.indexer.is_some() {
+      return self.compare_network_ids(&self.network_id, network_identifier);
+    }
+
     // Check the cache
     if let Some(cached_network_id) = self.get_from_cache(NetworkId) {
       return self.compare_network_ids(&cached_network_id, network_identifier);

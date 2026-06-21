@@ -320,6 +320,22 @@ impl IndexerClient {
     Ok(r.transactions)
   }
 
+  /// The best (latest) account nonce, or `None` if the account doesn't exist yet — used by
+  /// `construction/metadata` (current nonce to build a tx; receiver existence ⇒ creation fee).
+  pub async fn account_nonce(&self, public_key: &str) -> Result<Option<u32>, MinaMeshError> {
+    #[derive(Deserialize)]
+    struct A {
+      nonce: u32,
+    }
+    #[derive(Deserialize)]
+    struct R {
+      accounts: Vec<A>,
+    }
+    let q = format!(r#"query {{ accounts(query: {{ publicKey: {} }}, limit: 1) {{ nonce }} }}"#, Self::lit(public_key));
+    let r: R = self.gql(q).await?;
+    Ok(r.accounts.into_iter().next().map(|a| a.nonce))
+  }
+
   /// A single user command by hash (duplicate detection for `construction/submit`).
   pub async fn transaction_by_hash(&self, hash: &str) -> Result<Option<IxSearchTxn>, MinaMeshError> {
     #[derive(Deserialize)]

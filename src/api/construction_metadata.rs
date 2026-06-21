@@ -33,6 +33,34 @@ impl MinaMesh {
 
     let token_id = self.get_field_from_options(options, "token_id")?;
 
+    // Trustless mode: current nonce + receiver existence from the indexer; fees from
+    // constants (no Mina daemon). The account-creation fee is the protocol constant 1 MINA.
+    if let Some(indexer) = &self.indexer {
+      const ACCOUNT_CREATION_FEE: u64 = 1_000_000_000;
+      let inferred_nonce = indexer
+        .account_nonce(sender)
+        .await?
+        .ok_or_else(|| MinaMeshError::AccountNotFound(format!("Sender account not found: {sender}")))?
+        .to_string();
+      let receiver_exists = indexer.account_nonce(receiver).await?.is_some();
+      let account_creation_fee = (!receiver_exists).then(|| ACCOUNT_CREATION_FEE.to_string());
+      let valid_until = options.get("valid_until").and_then(|v| v.as_str());
+      let memo = options.get("memo").and_then(|v| v.as_str());
+      let metadata =
+        TransactionMetadata::new(sender, receiver, inferred_nonce, token_id, account_creation_fee, valid_until, memo);
+      let suggested_fee_entry = Amount {
+        value: MINIMUM_USER_COMMAND_FEE.to_string(),
+        currency: Box::new(create_currency(None)),
+        metadata: Some(json!({
+          "minimum_fee": { "value": MINIMUM_USER_COMMAND_FEE.to_string(), "currency": { "symbol": "MINA", "decimals": 9 } }
+        })),
+      };
+      return Ok(ConstructionMetadataResponse {
+        metadata: metadata.to_json(),
+        suggested_fee: Some(vec![suggested_fee_entry]),
+      });
+    }
+
     // Send GraphQL query
     let query_variables = QueryConstructionMetadataVariables {
       sender: PublicKey(sender.to_string()),
