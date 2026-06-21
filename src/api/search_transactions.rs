@@ -6,8 +6,8 @@ use coinbase_mesh::models::{
 use crate::{
   generate_internal_command_transaction_identifier, generate_operations_internal_command,
   generate_operations_user_command, generate_operations_zkapp_command, generate_transaction_metadata, ChainStatus,
-  HasTimestamp, InternalCommand, InternalCommandType, MinaMesh, MinaMeshError, TransactionStatus, UserCommand,
-  UserCommandType, ZkAppCommand,
+  HasTimestamp, IndexerClient, InternalCommand, InternalCommandType, IxSearchTxn, MinaMesh, MinaMeshError,
+  TransactionStatus, UserCommand, UserCommandMetadata, UserCommandType, ZkAppCommand,
 };
 
 impl MinaMesh {
@@ -16,6 +16,11 @@ impl MinaMesh {
     req: SearchTransactionsRequest,
   ) -> Result<SearchTransactionsResponse, MinaMeshError> {
     self.validate_network(&req.network_identifier).await?;
+    // Trustless backend: emulate search over the indexer (no offset/cursor pagination or
+    // total_count there). See `search_transactions_indexer` for the degradations.
+    if let Some(indexer) = &self.indexer {
+      return self.search_transactions_indexer(indexer, &req).await;
+    }
     let original_offset = req.offset.unwrap_or(0);
     let mut offset = original_offset;
     let mut limit = req.limit.unwrap_or(100);
@@ -92,6 +97,64 @@ impl MinaMesh {
     Ok(response)
   }
 
+  /// Search over the trustless indexer. The indexer has no offset/cursor pagination, no
+  /// `total_count`, and no combined sender-OR-receiver filter, so we fetch sender and
+  /// receiver user commands separately, union + dedupe by hash, filter, and page in Rust.
+  /// Degradations vs Postgres: only user commands (no internal/zkApp commands in search);
+  /// `total_count` is the size of the fetched window (capped), not the global total; and
+  /// per-result timestamps aren't available (the indexer gives ISO, not epoch millis).
+  async fn search_transactions_indexer(
+    &self,
+    indexer: &IndexerClient,
+    req: &SearchTransactionsRequest,
+  ) -> Result<SearchTransactionsResponse, MinaMeshError> {
+    let qp = SearchTransactionsQueryParams::try_from(req.clone())?;
+    let include_timestamp = req.include_timestamp.unwrap_or(false);
+    let limit = req.limit.unwrap_or(100).max(0) as usize;
+    let offset = req.offset.unwrap_or(0).max(0) as usize;
+    let max_height = qp.max_block.map(|h| h as u32);
+
+    let mut txns: Vec<IxSearchTxn> = Vec::new();
+    if let Some(hash) = &qp.transaction_hash {
+      if let Some(t) = indexer.transaction_by_hash(hash).await? {
+        txns.push(t);
+      }
+    } else if let Some(pk) = qp.account_identifier.clone().or_else(|| qp.address.clone()) {
+      // Fetch enough rows to cover the requested page; this also bounds total_count.
+      let cap = offset + limit.max(1) + 50;
+      let outgoing = indexer.account_transactions(&pk, true, max_height, cap).await?;
+      let incoming = indexer.account_transactions(&pk, false, max_height, cap).await?;
+      let mut seen = std::collections::HashSet::new();
+      for t in outgoing.into_iter().chain(incoming.into_iter()) {
+        if seen.insert(t.hash.clone()) {
+          txns.push(t);
+        }
+      }
+      // Newest first, hash as a stable tiebreak.
+      txns.sort_by(|a, b| b.block_height.cmp(&a.block_height).then_with(|| a.hash.cmp(&b.hash)));
+    }
+
+    // applied/failed filters (both map to is_applied).
+    if let Some(status) = &qp.status {
+      let want_applied = matches!(status, TransactionStatus::Applied);
+      txns.retain(|t| t.is_applied == want_applied);
+    }
+    if let Some(success) = &qp.success_status {
+      let want_applied = matches!(success, TransactionStatus::Applied);
+      txns.retain(|t| t.is_applied == want_applied);
+    }
+
+    let total_count = txns.len() as i64;
+    let transactions: Vec<BlockTransaction> =
+      txns.iter().skip(offset).take(limit).map(|t| ix_search_to_block_transaction(t, include_timestamp)).collect();
+    let next_offset = offset as i64 + transactions.len() as i64;
+    Ok(SearchTransactionsResponse {
+      transactions,
+      total_count,
+      next_offset: if next_offset < total_count { Some(next_offset) } else { None },
+    })
+  }
+
   pub async fn fetch_user_commands(
     &self,
     query_params: &SearchTransactionsQueryParams,
@@ -112,7 +175,7 @@ impl MinaMesh {
         limit,
         offset,
       )
-      .fetch_all(&self.pg_pool)
+      .fetch_all(self.pg()?)
       .await?;
       Ok(user_commands)
     } else {
@@ -129,7 +192,7 @@ impl MinaMesh {
         limit,
         offset,
       )
-      .fetch_all(&self.pg_pool)
+      .fetch_all(self.pg()?)
       .await?;
       Ok(user_commands)
     }
@@ -155,7 +218,7 @@ impl MinaMesh {
         limit,
         offset
       )
-      .fetch_all(&self.pg_pool)
+      .fetch_all(self.pg()?)
       .await?;
 
       Ok(internal_commands)
@@ -173,7 +236,7 @@ impl MinaMesh {
         limit,
         offset
       )
-      .fetch_all(&self.pg_pool)
+      .fetch_all(self.pg()?)
       .await?;
 
       Ok(internal_commands)
@@ -200,7 +263,7 @@ impl MinaMesh {
         limit,
         offset
       )
-      .fetch_all(&self.pg_pool)
+      .fetch_all(self.pg()?)
       .await?;
 
       Ok(zkapp_commands)
@@ -218,7 +281,7 @@ impl MinaMesh {
         limit,
         offset
       )
-      .fetch_all(&self.pg_pool)
+      .fetch_all(self.pg()?)
       .await?;
 
       Ok(zkapp_commands)
@@ -323,6 +386,46 @@ impl From<UserCommand> for BlockTransaction {
     };
     BlockTransaction::new(block_identifier, transaction)
   }
+}
+
+/// Map an indexer user-command search row into a Rosetta `BlockTransaction`, reusing the
+/// shared operation generators via `UserCommandMetadata`.
+fn ix_search_to_block_transaction(tx: &IxSearchTxn, include_timestamp: bool) -> BlockTransaction {
+  let command_type =
+    if tx.kind.to_uppercase().contains("DELEG") { UserCommandType::Delegation } else { UserCommandType::Payment };
+  let amount = match command_type {
+    UserCommandType::Payment => Some(tx.amount.to_string()),
+    UserCommandType::Delegation => None,
+  };
+  let meta = UserCommandMetadata {
+    command_type,
+    nonce: tx.nonce as i64,
+    amount,
+    fee: Some(tx.fee.to_string()),
+    valid_until: None,
+    memo: Some(tx.memo.clone()),
+    hash: tx.hash.clone(),
+    fee_payer: tx.from.clone(),
+    source: tx.from.clone(),
+    receiver: tx.to.clone().unwrap_or_default(),
+    status: if tx.is_applied { TransactionStatus::Applied } else { TransactionStatus::Failed },
+    failure_reason: tx.failure_reason.clone(),
+    creation_fee: None,
+  };
+  let transaction = Transaction {
+    transaction_identifier: Box::new(TransactionIdentifier::new(tx.hash.clone())),
+    operations: generate_operations_user_command(&meta),
+    metadata: generate_transaction_metadata(&meta),
+    related_transactions: None,
+  };
+  let block_identifier = BlockIdentifier::new(tx.block_height as i64, tx.block.state_hash.clone());
+  let mut bt = BlockTransaction::new(block_identifier, transaction);
+  // The indexer exposes ISO datetimes, not epoch millis, so per-result timestamps aren't
+  // available here (Rosetta wants i64 millis). include_timestamp callers get None.
+  if include_timestamp {
+    bt.timestamp = tx.block.date_time.parse::<i64>().ok();
+  }
+  bt
 }
 
 pub struct SearchTransactionsQueryParams {

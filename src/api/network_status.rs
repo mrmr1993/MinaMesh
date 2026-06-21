@@ -17,7 +17,15 @@ impl MinaMesh {
     let blocks = best_chain.ok_or(MinaMeshError::ChainInfoMissing)?;
     let first_block = blocks.first().ok_or(MinaMeshError::ChainInfoMissing)?;
     let Block4 { protocol_state, state_hash } = first_block;
-    let oldest_block = sqlx::query_file!("sql/queries/oldest_block.sql").fetch_one(&self.pg_pool).await?;
+    // Trustless backend: the archive availability floor comes from the indexer's earliest
+    // ingested block; else from the Postgres archive.
+    let oldest_block_identifier = if let Some(indexer) = &self.indexer {
+      let oldest = indexer.oldest().await?;
+      BlockIdentifier::new(oldest.block_height as i64, oldest.state_hash)
+    } else {
+      let oldest_block = sqlx::query_file!("sql/queries/oldest_block.sql").fetch_one(self.pg()?).await?;
+      BlockIdentifier::new(oldest_block.height, oldest_block.state_hash)
+    };
     Ok(NetworkStatusResponse {
       peers: Some(peers.into_iter().map(|peer| Peer::new(peer.peer_id)).collect()),
       current_block_identifier: Box::new(BlockIdentifier::new(
@@ -26,7 +34,7 @@ impl MinaMesh {
       )),
       current_block_timestamp: protocol_state.blockchain_state.utc_date.0.parse::<i64>()?,
       genesis_block_identifier: Box::new(self.genesis_block_identifier.clone()),
-      oldest_block_identifier: Some(Box::new(BlockIdentifier::new(oldest_block.height, oldest_block.state_hash))),
+      oldest_block_identifier: Some(Box::new(oldest_block_identifier)),
       sync_status: Some(Box::new(sync_status.into())),
     })
   }

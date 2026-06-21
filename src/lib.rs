@@ -4,6 +4,7 @@ mod config;
 mod create_router;
 mod error;
 mod graphql;
+mod indexer;
 mod light_node;
 pub mod memo;
 mod playground;
@@ -24,6 +25,7 @@ pub use create_router::create_router;
 use dashmap::DashMap;
 pub use error::*;
 use graphql::GraphQLClient;
+pub use indexer::*;
 pub use light_node::*;
 pub(crate) use roinput::*;
 use sqlx::PgPool;
@@ -32,7 +34,8 @@ pub use types::*;
 #[derive(Debug)]
 pub struct MinaMesh {
   pub graphql_client: GraphQLClient,
-  pub pg_pool: PgPool,
+  /// Archive Postgres. `None` when the trustless [`IndexerClient`] backs historical reads.
+  pub pg_pool: Option<PgPool>,
   pub genesis_block_identifier: BlockIdentifier,
   pub search_tx_optimized: bool,
   pub cache: DashMap<String, (String, Instant)>, // Cache for network_id or other reusable data
@@ -42,4 +45,19 @@ pub struct MinaMesh {
   /// balance, submit) are served from the mina-light-node instead of the GraphQL
   /// daemon. See [`LightNodeClient`].
   pub light_node: Option<LightNodeClient>,
+  /// Optional trustless backend: when set, historical reads (block, historical balance,
+  /// search, oldest block) are served from the mina-indexer instead of Postgres. See
+  /// [`IndexerClient`].
+  pub indexer: Option<IndexerClient>,
+}
+
+impl MinaMesh {
+  /// The archive Postgres pool, or an error when only the trustless indexer is configured.
+  /// Used by the PG fallback path of historical endpoints.
+  pub(crate) fn pg(&self) -> Result<&PgPool, MinaMeshError> {
+    self
+      .pg_pool
+      .as_ref()
+      .ok_or_else(|| MinaMeshError::Exception("no archive database configured (indexer-only mode)".to_string()))
+  }
 }

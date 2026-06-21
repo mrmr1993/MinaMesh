@@ -31,8 +31,51 @@ impl MinaMesh {
   ) -> Result<AccountBalanceResponse, MinaMeshError> {
     let index = partial_block_id.index;
     let hash = partial_block_id.hash;
+
+    // Trustless backend: resolve the block + historical balance from the indexer's staged
+    // ledger. No vesting `timing_info` is available there, so — like the light-node path —
+    // the whole balance is reported liquid (locked_balance: 0). Token filtering defaults to
+    // MINA (multi-token historical balances would need the indexer's token filter).
+    if let Some(indexer) = &self.indexer {
+      let token_id = Wrapper(metadata).token_id_or_default()?;
+      let block = match (&hash, index) {
+        (Some(h), _) => indexer.block(None, Some(h)).await?,
+        (None, Some(idx)) => indexer.block(Some(idx), None).await?,
+        (None, None) => indexer.block(Some(indexer.tip().await?.block_height as i64), None).await?,
+      }
+      .ok_or_else(|| MinaMeshError::BlockMissing(index, hash.clone()))?;
+      let block_identifier = BlockIdentifier { hash: block.state_hash.clone(), index: block.block_height as i64 };
+      return match indexer.staged_account(&public_key, block.block_height, None).await? {
+        Some(acct) => Ok(AccountBalanceResponse {
+          block_identifier: Box::new(block_identifier),
+          balances: vec![Amount {
+            currency: Box::new(create_currency(Some(&token_id))),
+            value: acct.balance_nano.to_string(),
+            metadata: Some(serde_json::json!({
+              "locked_balance": 0,
+              "liquid_balance": acct.balance_nano,
+              "total_balance": acct.balance_nano
+            })),
+          }],
+          metadata: Some(serde_json::json!({
+            "created_via_historical_lookup": true,
+            "nonce": acct.nonce.to_string()
+          })),
+        }),
+        None => Ok(AccountBalanceResponse {
+          block_identifier: Box::new(block_identifier),
+          balances: vec![Amount {
+            currency: Box::new(create_currency(None)),
+            value: "0".to_string(),
+            metadata: Some(serde_json::json!({ "locked_balance": 0, "liquid_balance": 0, "total_balance": 0 })),
+          }],
+          metadata: Some(serde_json::json!({ "created_via_historical_lookup": true, "nonce": "0" })),
+        }),
+      };
+    }
+
     let block = sqlx::query_file!("sql/queries/maybe_block.sql", index, hash)
-      .fetch_optional(&self.pg_pool)
+      .fetch_optional(self.pg()?)
       .await?
       .ok_or(MinaMeshError::BlockMissing(index, hash.clone()))?;
     let maybe_account_balance_info = sqlx::query_file!(
@@ -41,7 +84,7 @@ impl MinaMesh {
       block.height.ok_or(MinaMeshError::ChainInfoMissing)?,
       Wrapper(metadata).token_id_or_default()?
     )
-    .fetch_optional(&self.pg_pool)
+    .fetch_optional(self.pg()?)
     .await?;
     match maybe_account_balance_info {
       None => Ok(AccountBalanceResponse {
@@ -65,7 +108,7 @@ impl MinaMesh {
         let nonce = account_balance_info.nonce;
         let last_relevant_command_balance = account_balance_info.balance.parse::<u64>()?;
         let timing_info = sqlx::query_file!("sql/queries/timing_info.sql", account_balance_info.timing_id)
-          .fetch_optional(&self.pg_pool)
+          .fetch_optional(self.pg()?)
           .await?;
         let liquid_balance = match timing_info {
           Some(timing_info) => {

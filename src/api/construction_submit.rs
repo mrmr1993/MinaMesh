@@ -137,10 +137,21 @@ impl MinaMesh {
     let sender = &payment.from;
     let receiver = &payment.to;
     let nonce = payment.nonce as i64;
+    // Trustless backend: scan the sender's recent commands for an exact duplicate.
+    if let Some(indexer) = &self.indexer {
+      let txns = indexer.account_transactions(sender, true, None, 200).await?;
+      let found = txns.iter().any(|t| {
+        t.nonce as i64 == nonce
+          && t.amount == payment.amount
+          && t.fee == payment.fee
+          && t.to.as_deref() == Some(receiver.as_str())
+      });
+      return Ok(found);
+    }
     let amount = &payment.amount.to_string();
     let fee = &payment.fee.to_string();
     let row = sqlx::query_file!("sql/queries/query_payment.sql", nonce, sender, receiver, amount, fee)
-      .fetch_optional(&self.pg_pool)
+      .fetch_optional(self.pg()?)
       .await?;
 
     Ok(row.is_some())
