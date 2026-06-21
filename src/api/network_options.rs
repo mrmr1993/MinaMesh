@@ -9,7 +9,13 @@ use crate::{operation_types, MinaMesh, MinaMeshError};
 impl MinaMesh {
   pub async fn network_options(&self, req: NetworkRequest) -> Result<NetworkOptionsResponse, MinaMeshError> {
     self.validate_network(&req.network_identifier).await?;
-    let errors: Vec<Error> = MinaMeshError::all_errors().into_iter().map(Error::from).collect();
+    // The /network/options error catalog lists *possible* errors as templates; the Mesh
+    // asserter requires their `details` to be empty (details are only populated on actual
+    // error responses).
+    let errors: Vec<Error> = MinaMeshError::all_errors()
+      .into_iter()
+      .map(|e| Error { details: None, ..Error::from(e) })
+      .collect();
 
     Ok(NetworkOptionsResponse::new(
       Version::new("1.4.9".to_string(), "1.0.0".to_string()),

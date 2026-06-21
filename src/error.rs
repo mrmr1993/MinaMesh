@@ -188,7 +188,7 @@ impl MinaMeshError {
   /// Provides additional details about the error.
   pub fn details(&self) -> serde_json::Value {
     match self {
-      MinaMeshError::NoOptionsProvided => json!("No 'options' provided"),
+      MinaMeshError::NoOptionsProvided => json!({ "error": "No 'options' provided" }),
       MinaMeshError::GraphqlMinaQuery(msg) => json!({
           "error": msg,
           "extra": "Internal POST to Mina Daemon failed"
@@ -281,7 +281,9 @@ impl MinaMeshError {
         })
       }
 
-      _ => json!(""),
+      // Mesh requires `details` to be an object (map), never a bare string — return an empty
+      // object for errors that carry no structured detail.
+      _ => json!({}),
     }
   }
 
