@@ -167,6 +167,9 @@ pub struct IxTxnBlock {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IxStagedAccount {
+  // The indexer pins this field's wire name to snake_case (`#[graphql(name = "balance_nano")]`),
+  // unlike its other camelCased fields — so query + deserialize it as `balance_nano`.
+  #[serde(rename = "balance_nano")]
   pub balance_nano: u64,
   pub nonce: u32,
   pub token: String,
@@ -281,7 +284,7 @@ impl IndexerClient {
     }
     let q = format!(
       r#"query {{ stagedLedgerAccounts(query: {{ publicKey: {}, blockchain_length: {height}{token_filter} }}) {{
-        balanceNano nonce token
+        balance_nano nonce token
       }} }}"#,
       Self::lit(public_key)
     );

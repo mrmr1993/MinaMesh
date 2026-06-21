@@ -48,20 +48,27 @@ pub fn operation(
   }
 }
 
-// Decode a transaction memo
+// Decode a transaction memo.
+//
+// A raw Mina memo is base58check of a `[tag, len, ...bytes, padding]` structure (what the
+// Postgres archive stores). The trustless indexer, by contrast, already returns the *decoded*
+// memo string. Handle both, and never panic on a short/ill-formed buffer (a malformed memo
+// must not crash the request worker): decode the structure when it's present, otherwise pass
+// the input through as an already-decoded memo.
 pub fn decode_memo(memo: &Option<String>) -> Option<String> {
-  let memo = memo.clone();
-  if let Some(memo) = memo {
-    match bs58::decode(memo).into_vec() {
-      Ok(decoded_bytes) => {
-        let cleaned = &decoded_bytes[3..decoded_bytes[2] as usize + 3];
-        Some(String::from_utf8_lossy(cleaned).to_string())
-      }
-      Err(_) => None,
-    }
-  } else {
-    None
+  let memo = memo.as_ref()?.trim();
+  if memo.is_empty() {
+    return None;
   }
+  if let Ok(bytes) = bs58::decode(memo).into_vec() {
+    if bytes.len() >= 3 {
+      let end = bytes[2] as usize + 3;
+      if end <= bytes.len() {
+        return Some(String::from_utf8_lossy(&bytes[3..end]).to_string());
+      }
+    }
+  }
+  Some(memo.to_string())
 }
 
 // Construct transaction metadata
