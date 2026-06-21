@@ -123,44 +123,79 @@ impl MinaMesh {
       });
     }
 
-    // Internal commands: coinbase, then fee transfers (all applied). Amounts are nanomina.
+    // Internal commands: coinbase + fee transfers + SNARK-work fees (all applied; nanomina).
+    //
+    // The block producer pays the SNARK-work fees out of its fee pool, so its coinbase/fee
+    // credits are reported NET of them, and each prover *other than* the producer is credited
+    // its fee (a prover == producer nets out — its fee is forfeited, not re-credited). This
+    // matches the ledger effect and the Postgres internal-command behavior.
+    let producer = ix.transactions.coinbase_receiver.clone();
+    // The producer pays ALL SNARK-work fees out of its fee pool, so its coinbase/fee credits
+    // are reported net of them. The provers' own fee transfers are already in the list below
+    // (as plain fee transfers crediting the prover), so we model the producer's debit once —
+    // by netting total snark out of the producer here — and emit every fee transfer as plain
+    // (no via-coinbase producer debit, which would double-count). A self-snark prover has no
+    // offsetting transfer, so its fee is simply forfeited from the producer (matches the ledger).
+    let total_snark: u64 = ix.snark_jobs.iter().map(|j| j.fee).sum();
+    // Snark comes out of the producer's own fee transfers first, then its coinbase.
+    let producer_fee_total: u64 = ix
+      .transactions
+      .fee_transfer
+      .iter()
+      .filter(|ft| producer.as_ref() == Some(&ft.recipient))
+      .filter_map(|ft| ft.fee.parse::<u64>().ok())
+      .sum();
+    let snark_from_fees = total_snark.min(producer_fee_total);
+    let snark_from_coinbase = total_snark - snark_from_fees;
+
     let mut seq = 0i32;
     if ix.transactions.coinbase != "0" {
       if let Some(receiver) = &ix.transactions.coinbase_receiver {
-        let meta = InternalCommandMetadata {
-          command_type: InternalCommandType::Coinbase,
-          receiver: receiver.clone(),
-          fee: Some(ix.transactions.coinbase.clone()),
-          hash: ix.state_hash.clone(),
-          creation_fee: ix
-            .transactions
-            .coinbase_receiver_account_creation_fee_paid
-            .then(|| ACCOUNT_CREATION_FEE.to_string()),
-          sequence_no: seq,
-          secondary_sequence_no: 0,
-          status: TransactionStatus::Applied,
-          coinbase_receiver: Some(receiver.clone()),
-        };
-        transactions.push(internal_command_transaction(&meta));
-        seq += 1;
+        let coinbase = ix.transactions.coinbase.parse::<u64>().unwrap_or(0).saturating_sub(snark_from_coinbase);
+        if coinbase > 0 {
+          let meta = InternalCommandMetadata {
+            command_type: InternalCommandType::Coinbase,
+            receiver: receiver.clone(),
+            fee: Some(coinbase.to_string()),
+            hash: ix.state_hash.clone(),
+            creation_fee: ix
+              .transactions
+              .coinbase_receiver_account_creation_fee_paid
+              .then(|| ACCOUNT_CREATION_FEE.to_string()),
+            sequence_no: seq,
+            secondary_sequence_no: 0,
+            status: TransactionStatus::Applied,
+            coinbase_receiver: Some(receiver.clone()),
+          };
+          transactions.push(internal_command_transaction(&meta));
+          seq += 1;
+        }
       }
     }
+    let mut fee_deduct_remaining = snark_from_fees;
     for ft in &ix.transactions.fee_transfer {
-      let command_type = if ft.kind.to_lowercase().contains("via_coinbase") {
-        InternalCommandType::FeeTransferViaCoinbase
-      } else {
-        InternalCommandType::FeeTransfer
-      };
+      let mut fee = ft.fee.parse::<u64>().unwrap_or(0);
+      if producer.as_ref() == Some(&ft.recipient) && fee_deduct_remaining > 0 {
+        let d = fee.min(fee_deduct_remaining);
+        fee -= d;
+        fee_deduct_remaining -= d;
+      }
+      if fee == 0 {
+        continue;
+      }
+      // Always plain: the producer's debit for snark/via-coinbase fees is already modeled by
+      // netting `total_snark` out of the producer above — classifying as via-coinbase here
+      // would debit the producer a second time.
       let meta = InternalCommandMetadata {
-        command_type,
+        command_type: InternalCommandType::FeeTransfer,
         receiver: ft.recipient.clone(),
-        fee: Some(ft.fee.clone()),
+        fee: Some(fee.to_string()),
         hash: ix.state_hash.clone(),
         creation_fee: None,
         sequence_no: seq,
         secondary_sequence_no: 0,
         status: TransactionStatus::Applied,
-        coinbase_receiver: ix.transactions.coinbase_receiver.clone(),
+        coinbase_receiver: producer.clone(),
       };
       transactions.push(internal_command_transaction(&meta));
       seq += 1;

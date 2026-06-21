@@ -80,6 +80,17 @@ pub struct IxBlock {
   pub creator_account: IxPk,
   pub protocol_state: IxProtocolState,
   pub transactions: IxBlockTxns,
+  /// SNARK-work fees the block producer pays out of the fee pool (nanomina). Needed so the
+  /// producer's fee credit is reported net of them (and non-producer provers are credited).
+  #[serde(default)]
+  pub snark_jobs: Vec<IxSnarkJob>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IxSnarkJob {
+  pub fee: u64,
+  pub prover: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -270,6 +281,7 @@ impl IndexerClient {
           feeTransfer {{ fee recipient type }}
           userCommands {{ amount fee from to nonce memo hash kind failureReason isApplied receiver_account_creation_fee_paid }}
         }}
+        snarkJobs {{ fee prover }}
       }} }}"#
     );
     let r: R = self.gql(q).await?;
