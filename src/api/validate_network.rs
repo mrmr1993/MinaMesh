@@ -1,8 +1,7 @@
 use anyhow::Result;
 use coinbase_mesh::models::NetworkIdentifier;
-use cynic::QueryBuilder;
 
-use crate::{graphql::QueryNetworkId, CacheKey::NetworkId, MinaMesh, MinaMeshError};
+use crate::{CacheKey::NetworkId, MinaMesh, MinaMeshError};
 
 impl MinaMesh {
   // Validate that the network identifier matches the network id of the GraphQL
@@ -18,8 +17,8 @@ impl MinaMesh {
       return self.compare_network_ids(&cached_network_id, network_identifier);
     }
 
-    // Fetch from GraphQL if cache is empty or expired
-    let QueryNetworkId { network_id } = self.graphql_client.send(QueryNetworkId::build(())).await?;
+    // Fetch from the node (daemon) if cache is empty or expired.
+    let network_id = self.node.network_id().await?;
     self.insert_into_cache(NetworkId, network_id.clone());
     self.compare_network_ids(&network_id, network_identifier)
   }

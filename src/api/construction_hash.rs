@@ -8,8 +8,7 @@ use mina_p2p_messages::{
     MinaBaseSignedCommandMemoStableV1, MinaBaseSignedCommandPayloadBodyStableV2,
     MinaBaseSignedCommandPayloadCommonStableV2, MinaBaseSignedCommandPayloadStableV2, MinaBaseSignedCommandStableV2,
     MinaBaseStakeDelegationStableV2, MinaBaseUserCommandStableV2, MinaNumbersGlobalSlotSinceGenesisMStableV1,
-    NonZeroCurvePoint,
-    NonZeroCurvePointUncompressedStableV1, UnsignedExtendedUInt32StableV1,
+    NonZeroCurvePoint, NonZeroCurvePointUncompressedStableV1, UnsignedExtendedUInt32StableV1,
     UnsignedExtendedUInt64Int64ForVersionTagsStableV1,
   },
 };
@@ -85,10 +84,8 @@ impl MinaMesh {
       )));
     };
 
-    let signature = MinaBaseSignatureStableV1(
-      BigInt::from(signature.rx.into_repr()),
-      BigInt::from(signature.s.into_repr()),
-    );
+    let signature =
+      MinaBaseSignatureStableV1(BigInt::from(signature.rx.into_repr()), BigInt::from(signature.s.into_repr()));
     let signed =
       MinaBaseSignedCommandStableV2 { payload: user_command_payload.into(), signer, signature: signature.into() };
     Ok(MinaBaseUserCommandStableV2::SignedCommand(signed))

@@ -187,11 +187,14 @@ fn test_conversion_from_parse_int_error() {
 async fn test_conversion_from_cynic_reqwest_error() -> Result<(), MinaMeshError> {
   dotenv::dotenv().ok();
   let res = MinaMeshConfig {
-    proxy_url: "http://wrong-graphql".to_string(),
-    archive_database_url: env::var("MINAMESH_ARCHIVE_DATABASE_URL").unwrap(),
+    proxy_url: Some("http://wrong-graphql".to_string()),
+    archive_database_url: Some(env::var("MINAMESH_ARCHIVE_DATABASE_URL").unwrap()),
     max_db_pool_size: 10,
     db_pool_idle_timeout: 1,
     use_search_tx_optimizations: false,
+    light_node_url: None,
+    indexer_url: None,
+    network: "devnet".to_string(),
   }
   .to_mina_mesh()
   .await;
@@ -212,11 +215,14 @@ fn test_conversion_from_anyhow_error() {
 async fn test_graphql_uri_not_set_error() -> Result<(), MinaMeshError> {
   dotenv::dotenv().ok();
   let res = MinaMeshConfig {
-    proxy_url: "".to_string(),
-    archive_database_url: env::var("MINAMESH_ARCHIVE_DATABASE_URL").unwrap(),
+    proxy_url: Some("".to_string()),
+    archive_database_url: Some(env::var("MINAMESH_ARCHIVE_DATABASE_URL").unwrap()),
     max_db_pool_size: 10,
     db_pool_idle_timeout: 1,
     use_search_tx_optimizations: false,
+    light_node_url: None,
+    indexer_url: None,
+    network: "devnet".to_string(),
   }
   .to_mina_mesh()
   .await;

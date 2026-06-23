@@ -50,6 +50,23 @@ pub struct LightSubmit {
   pub echoes: usize,
 }
 
+/// A single pending command decoded by the light node's `/mempool/tx` endpoint. Mirrors the
+/// light node's `DecodedCommand`: neutral fields with B62 public keys and nanomina amounts.
+#[derive(Debug, Deserialize)]
+pub struct LightMempoolTx {
+  /// `"payment"` or `"delegation"`.
+  pub kind: String,
+  pub fee_payer: String,
+  pub source: String,
+  pub receiver: String,
+  pub amount: u64,
+  pub fee: u64,
+  pub nonce: u32,
+  pub valid_until: Option<u32>,
+  pub memo: String,
+  pub hash: String,
+}
+
 impl LightNodeClient {
   pub fn new(base_url: String) -> Self {
     Self { base_url: base_url.trim_end_matches('/').to_string(), http: reqwest::Client::new() }
@@ -57,21 +74,14 @@ impl LightNodeClient {
 
   async fn get_json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T, MinaMeshError> {
     let url = format!("{}{}", self.base_url, path);
-    let resp = self
-      .http
-      .get(&url)
-      .send()
-      .await
-      .map_err(|e| MinaMeshError::Exception(format!("light-node GET {path}: {e}")))?;
+    let resp =
+      self.http.get(&url).send().await.map_err(|e| MinaMeshError::Exception(format!("light-node GET {path}: {e}")))?;
     if !resp.status().is_success() {
       let status = resp.status();
       let body = resp.text().await.unwrap_or_default();
       return Err(MinaMeshError::Exception(format!("light-node GET {path} -> {status}: {body}")));
     }
-    resp
-      .json::<T>()
-      .await
-      .map_err(|e| MinaMeshError::Exception(format!("light-node GET {path} decode: {e}")))
+    resp.json::<T>().await.map_err(|e| MinaMeshError::Exception(format!("light-node GET {path} decode: {e}")))
   }
 
   /// The verified best tip (height + epoch-ledger root).
@@ -82,6 +92,29 @@ impl LightNodeClient {
   /// Best-effort pending transaction hashes from the gossip tap.
   pub async fn mempool(&self) -> Result<LightMempool, MinaMeshError> {
     self.get_json("/mempool").await
+  }
+
+  /// A single pending command by hash, decoded into neutral fields. `Ok(None)` when the
+  /// hash isn't a pending command the light node has seen (or it's a zkApp command, which
+  /// the endpoint doesn't expose) — a 404. Best-effort and untrusted, like `/mempool`.
+  pub async fn mempool_transaction(&self, hash: &str) -> Result<Option<LightMempoolTx>, MinaMeshError> {
+    let path = format!("/mempool/tx?hash={hash}");
+    let url = format!("{}{}", self.base_url, path);
+    let resp =
+      self.http.get(&url).send().await.map_err(|e| MinaMeshError::Exception(format!("light-node GET {path}: {e}")))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+      return Ok(None);
+    }
+    if !resp.status().is_success() {
+      let status = resp.status();
+      let body = resp.text().await.unwrap_or_default();
+      return Err(MinaMeshError::Exception(format!("light-node GET {path} -> {status}: {body}")));
+    }
+    resp
+      .json::<LightMempoolTx>()
+      .await
+      .map(Some)
+      .map_err(|e| MinaMeshError::Exception(format!("light-node GET {path} decode: {e}")))
   }
 
   /// Proof-anchored balance + nonce for `pubkey`. The light node resolves the leaf index

@@ -9,15 +9,18 @@ use sqlx::postgres::PgPoolOptions;
 
 use crate::{
   graphql::{self, GraphQLClient},
-  util::default_mina_proxy_url,
   MinaMesh, MinaMeshError,
 };
 
 #[derive(Debug, Args)]
 pub struct MinaMeshConfig {
-  /// The URL of the Mina GraphQL
-  #[arg(long, env = "MINAMESH_PROXY_URL", default_value_t = default_mina_proxy_url())]
-  pub proxy_url: String,
+  /// The URL of the Mina GraphQL daemon. Required only in **full mode** (no light node):
+  /// it backs the trusted [`DaemonBackend`]. There is intentionally **no default** — the old
+  /// default (`https://mainnet.minaprotocol.network/graphql`) was a footgun: in trustless mode
+  /// any accidental daemon use silently hit public mainnet. Now, with no light node and no
+  /// `proxy_url`, startup fails loudly instead.
+  #[arg(long, env = "MINAMESH_PROXY_URL")]
+  pub proxy_url: Option<String>,
 
   /// The URL of the Archive Database. Optional when `MINAMESH_INDEXER_URL` is set —
   /// historical reads then come from the trustless mina-indexer instead of Postgres.
@@ -73,10 +76,6 @@ impl MinaMeshConfig {
   }
 
   pub async fn to_mina_mesh(self) -> Result<MinaMesh, MinaMeshError> {
-    let light_node = self.light_node_url.as_ref().map(|url| {
-      tracing::info!("Trustless light-node backend enabled at {url}");
-      crate::LightNodeClient::new(url.to_owned())
-    });
     let indexer = self.indexer_url.as_ref().map(|url| {
       tracing::info!("Trustless indexer backend enabled at {url}");
       crate::IndexerClient::new(url.to_owned())
@@ -100,7 +99,24 @@ impl MinaMeshConfig {
     };
     // `mina:<network>` — the Rosetta network id this server validates against.
     let network_id = format!("mina:{}", self.network);
-    let graphql_client = GraphQLClient::new(self.proxy_url.to_owned());
+
+    // Select the live-node backend behind the `MinaNode` trait:
+    //   light-node configured  ⇒ trustless `LightNodeBackend` (provenance Verified)
+    //   else                   ⇒ trusted `DaemonBackend` over the configured `proxy_url`.
+    // The `DaemonBackend` is the *only* holder of a `GraphQLClient`. In trustless mode no such
+    // client exists, so there is nothing to silently fall through to a public daemon.
+    let (node, daemon_client_for_genesis): (Box<dyn crate::MinaNode>, Option<GraphQLClient>) =
+      if let Some(url) = &self.light_node_url {
+        tracing::info!("Trustless light-node backend enabled at {url}");
+        let backend = crate::LightNodeBackend::new(crate::LightNodeClient::new(url.to_owned()), network_id.clone());
+        (Box::new(backend), None)
+      } else {
+        // Full mode: a daemon is mandatory. No mainnet default — fail loudly if unset.
+        let proxy_url = self.proxy_url.clone().filter(|u| !u.is_empty()).ok_or(MinaMeshError::GraphqlUriNotSet)?;
+        tracing::info!("Trusted daemon backend at {proxy_url}");
+        let client = GraphQLClient::new(proxy_url);
+        (Box::new(crate::DaemonBackend::new(client.clone())), Some(client))
+      };
 
     // Genesis identifier: from the indexer in trustless mode (no daemon), else the daemon.
     let genesis_block_identifier = if let Some(indexer) = &indexer {
@@ -119,15 +135,13 @@ impl MinaMeshConfig {
           }
         }
       }
-      found.ok_or_else(|| {
-        MinaMeshError::Exception(format!("indexer not reachable for genesis identifier: {last:?}"))
-      })?
+      found
+        .ok_or_else(|| MinaMeshError::Exception(format!("indexer not reachable for genesis identifier: {last:?}")))?
     } else {
-      if self.proxy_url.is_empty() {
-        return Err(MinaMeshError::GraphqlUriNotSet);
-      }
-      tracing::info!("Connecting to Mina GraphQL endpoint at {}", self.proxy_url);
-      let res = graphql_client.send(graphql::QueryGenesisBlockIdentifier::build(())).await?;
+      // History from Postgres ⇒ genesis from the daemon. Only reachable in full mode, where
+      // `daemon_client_for_genesis` is `Some`.
+      let client = daemon_client_for_genesis.ok_or(MinaMeshError::GraphqlUriNotSet)?;
+      let res = client.send(graphql::QueryGenesisBlockIdentifier::build(())).await?;
       let block_height = res.genesis_block.protocol_state.consensus_state.block_height.0.parse::<i64>()?;
       let state_hash = res.genesis_block.state_hash.0.clone();
       BlockIdentifier::new(block_height, state_hash)
@@ -135,7 +149,7 @@ impl MinaMeshConfig {
     tracing::info!("network {network_id}, genesis {genesis_block_identifier:?}");
 
     Ok(MinaMesh {
-      graphql_client,
+      node,
       network_id,
       pg_pool,
       genesis_block_identifier,
@@ -143,7 +157,6 @@ impl MinaMeshConfig {
       cache: DashMap::new(),
       cache_ttl: Duration::from_secs(300),
       cache_tx_size: 100, // Cache limit for last n transactions submitted
-      light_node,
       indexer,
     })
   }

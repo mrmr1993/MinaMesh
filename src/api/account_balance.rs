@@ -1,16 +1,8 @@
 use coinbase_mesh::models::{
   AccountBalanceRequest, AccountBalanceResponse, AccountIdentifier, Amount, BlockIdentifier, PartialBlockIdentifier,
 };
-use cynic::QueryBuilder;
 
-use crate::{
-  create_currency,
-  graphql::{
-    Account3, AccountNonce, AnnotatedBalance, Balance, Length, QueryBalance, QueryBalanceVariables, StateHash, TokenId,
-  },
-  util::Wrapper,
-  MinaMesh, MinaMeshError,
-};
+use crate::{create_currency, util::Wrapper, MinaMesh, MinaMeshError, Provenance};
 
 /// https://github.com/MinaProtocol/mina/blob/985eda49bdfabc046ef9001d3c406e688bc7ec45/src/app/rosetta/lib/account.ml#L11
 impl MinaMesh {
@@ -148,75 +140,41 @@ impl MinaMesh {
   }
 
   async fn frontier_balance(&self, public_key: String) -> Result<AccountBalanceResponse, MinaMeshError> {
-    // Trustless backend: Merkle-proved balance/nonce from the light node. NB this is the
-    // finalized *epoch-ledger* balance (what peers serve), anchored to the verified tip —
-    // not the staged-tip balance. Marked in metadata; no vesting split is available.
-    if let Some(light_node) = &self.light_node {
-      let acct = light_node.account(&public_key).await?;
-      return Ok(AccountBalanceResponse {
-        block_identifier: Box::new(BlockIdentifier {
-          hash: acct.anchored_state_hash,
-          index: acct.anchored_height as i64,
-        }),
-        balances: vec![Amount {
-          currency: Box::new(create_currency(None)),
-          value: acct.balance.to_string(),
-          metadata: Some(serde_json::json!({
-            "locked_balance": 0,
-            "liquid_balance": acct.balance,
-            "total_balance": acct.balance
-          })),
-        }],
-        metadata: Some(serde_json::json!({
-          "created_via_historical_lookup": false,
-          "nonce": acct.nonce.to_string(),
-          "trustless": true,
-          "ledger": acct.ledger
-        })),
-      });
-    }
-
-    let result = self
-      .graphql_client
-      .send(QueryBalance::build(QueryBalanceVariables { public_key: public_key.clone().into() }))
-      .await?;
-    if let QueryBalance {
-      account:
-        Some(Account3 {
-          balance:
-            AnnotatedBalance {
-              block_height: Length(index_raw),
-              state_hash: Some(StateHash(hash)),
-              liquid: Some(Balance(liquid_raw)),
-              total: Balance(total_raw),
-            },
-          nonce: Some(AccountNonce(nonce)),
-          token_id: TokenId(token_id),
-        }),
-    } = result
-    {
-      let total = total_raw.parse::<u64>()?;
-      let liquid = liquid_raw.parse::<u64>()?;
-      let index = index_raw.parse::<i64>()?;
-      Ok(AccountBalanceResponse {
-        block_identifier: Box::new(BlockIdentifier { hash, index }),
-        balances: vec![Amount {
-          currency: Box::new(create_currency(Some(&token_id))),
-          value: total_raw,
-          metadata: Some(serde_json::json!({
-            "locked_balance": (total - liquid),
-            "liquid_balance": liquid,
-            "total_balance": total
-          })),
-        }],
-        metadata: Some(serde_json::json!({
-          "created_via_historical_lookup": false,
-          "nonce": format!("{}", nonce)
-        })),
+    // The live account state comes from the node behind the trait — light node (Merkle-proved
+    // epoch-ledger balance anchored to the verified tip; whole balance reported liquid, no
+    // vesting split) or daemon (staged-tip balance with the liquid/locked split). The
+    // provenance decides only the trustless metadata markers, so each path stays byte-identical.
+    let acct = self.node.account(&public_key, None).await?.ok_or(MinaMeshError::AccountNotFound(public_key))?;
+    let verified = self.node.provenance() == Provenance::Verified;
+    let metadata = if verified {
+      serde_json::json!({
+        "created_via_historical_lookup": false,
+        "nonce": acct.nonce.to_string(),
+        "trustless": true,
+        // The light node proves balances against the finalized epoch ledger peers serve.
+        "ledger": acct.ledger.clone().unwrap_or_default()
       })
     } else {
-      Err(MinaMeshError::AccountNotFound(public_key))
-    }
+      serde_json::json!({
+        "created_via_historical_lookup": false,
+        "nonce": format!("{}", acct.nonce)
+      })
+    };
+    // Trusted daemon reports the token id; the light node is MINA-only (default token).
+    let currency = if verified { create_currency(None) } else { create_currency(Some(&acct.token_id)) };
+    Ok(AccountBalanceResponse {
+      block_identifier: Box::new(BlockIdentifier { hash: acct.block_state_hash, index: acct.block_height }),
+      balances: vec![Amount {
+        currency: Box::new(currency),
+        value: acct.total_balance.to_string(),
+        metadata: Some(serde_json::json!({
+          "locked_balance": acct.locked_balance,
+          "liquid_balance": acct.liquid_balance,
+          "total_balance": acct.total_balance
+        })),
+      }],
+      metadata: Some(metadata),
+    })
   }
 }
 

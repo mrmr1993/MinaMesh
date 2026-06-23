@@ -3,7 +3,7 @@ use reqwest::Client;
 
 use crate::MinaMeshError;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GraphQLClient {
   mina_proxy_url: String,
   client: Client,

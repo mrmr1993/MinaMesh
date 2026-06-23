@@ -7,6 +7,7 @@ mod graphql;
 mod indexer;
 mod light_node;
 pub mod memo;
+mod node;
 mod playground;
 mod roinput;
 pub mod signer_utils;
@@ -24,16 +25,20 @@ pub use config::*;
 pub use create_router::create_router;
 use dashmap::DashMap;
 pub use error::*;
-use graphql::GraphQLClient;
 pub use indexer::*;
 pub use light_node::*;
+pub use node::*;
 pub(crate) use roinput::*;
 use sqlx::PgPool;
 pub use transaction_operations::*;
 pub use types::*;
-#[derive(Debug)]
 pub struct MinaMesh {
-  pub graphql_client: GraphQLClient,
+  /// The live node, behind one trait. In full mode this is a [`DaemonBackend`] (the only
+  /// holder of a `GraphQLClient`); in trustless mode a [`LightNodeBackend`]. There is **no**
+  /// ambient daemon client to fall through to — any daemon use must go through this adapter,
+  /// which only exists in full mode, so a trustless deployment can never silently hit a
+  /// public daemon (the old `proxy_url`-defaults-to-mainnet footgun).
+  pub node: Box<dyn MinaNode>,
   /// The Rosetta network id this server serves, `mina:<network>`. In trustless mode it's the
   /// source of truth for network validation / `/network/list` (no daemon query needed).
   pub network_id: String,
@@ -44,10 +49,6 @@ pub struct MinaMesh {
   pub cache: DashMap<String, (String, Instant)>, // Cache for network_id or other reusable data
   pub cache_ttl: Duration,                       /* Cache time-to-live (network_id is refreshed after this time) */
   pub cache_tx_size: usize,                      // Cache limit for last n transactions submitted
-  /// Optional trustless backend: when set, live-state endpoints (mempool, frontier
-  /// balance, submit) are served from the mina-light-node instead of the GraphQL
-  /// daemon. See [`LightNodeClient`].
-  pub light_node: Option<LightNodeClient>,
   /// Optional trustless backend: when set, historical reads (block, historical balance,
   /// search, oldest block) are served from the mina-indexer instead of Postgres. See
   /// [`IndexerClient`].

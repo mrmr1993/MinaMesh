@@ -1,14 +1,10 @@
 use anyhow::Result;
 use coinbase_mesh::models::{Amount, ConstructionMetadataRequest, ConstructionMetadataResponse};
-use cynic::QueryBuilder;
 use serde_json::{json, Value};
 
 use crate::{
-  create_currency,
-  graphql::{Block3, PublicKey, QueryConstructionMetadata, QueryConstructionMetadataVariables, TokenId},
-  signer_utils::validate_base58_with_checksum,
-  util::{DEFAULT_TOKEN_ID, MINIMUM_USER_COMMAND_FEE},
-  MinaMesh, MinaMeshError, TransactionMetadata,
+  create_currency, graphql::Block3, signer_utils::validate_base58_with_checksum, util::MINIMUM_USER_COMMAND_FEE,
+  DaemonBackend, MinaMesh, MinaMeshError, TransactionMetadata,
 };
 
 /// https://github.com/MinaProtocol/mina/blob/985eda49bdfabc046ef9001d3c406e688bc7ec45/src/app/rosetta/lib/construction.ml#L133
@@ -61,16 +57,16 @@ impl MinaMesh {
       });
     }
 
-    // Send GraphQL query
-    let query_variables = QueryConstructionMetadataVariables {
-      sender: PublicKey(sender.to_string()),
-      // for now, nonce is based on the fee payer's account using the default token ID
-      // https://github.com/MinaProtocol/mina/blob/985eda49bdfabc046ef9001d3c406e688bc7ec45/src/app/rosetta/lib/construction.ml#L239
-      token_id: Some(TokenId(DEFAULT_TOKEN_ID.to_string())),
-      receiver_key: PublicKey(receiver.to_string()),
-    };
-    let query = QueryConstructionMetadata::build(query_variables);
-    let response = self.graphql_client.send(query).await?;
+    // Full mode: the sender nonce + receiver existence are *account* concerns and now go
+    // through the node trait. The suggested-fee (best-chain) and genesis account-creation-fee
+    // are daemon-only queries not part of the unified live surface, so they come from the
+    // `DaemonBackend` escape hatch — which only exists in full mode (no ambient client).
+    let daemon = self
+      .node
+      .as_any()
+      .downcast_ref::<DaemonBackend>()
+      .ok_or_else(|| MinaMeshError::Exception("construction/metadata requires a daemon backend".to_string()))?;
+    let response = daemon.construction_metadata_query(sender, receiver).await?;
 
     // Extract inferred nonce from sender
     let inferred_nonce = response

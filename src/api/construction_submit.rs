@@ -1,12 +1,8 @@
 use anyhow::Result;
 use coinbase_mesh::models::{ConstructionSubmitRequest, TransactionIdentifier, TransactionIdentifierResponse};
-use cynic::MutationBuilder;
 use mina_p2p_messages::binprot::BinProtWrite;
 
-use crate::{
-  graphql::{SendDelegation, SendDelegationVariables, SendPayment, SendPaymentVariables},
-  MinaMesh, MinaMeshError, Payment, StakeDelegation, TransactionSigned,
-};
+use crate::{MinaMesh, MinaMeshError, Payment, Provenance, SignedDelegation, SignedPayment, TransactionSigned};
 
 /// https://github.com/MinaProtocol/mina/blob/985eda49bdfabc046ef9001d3c406e688bc7ec45/src/app/rosetta/lib/construction.ml#L849
 impl MinaMesh {
@@ -23,114 +19,69 @@ impl MinaMesh {
       )));
     }
 
-    // Trustless backend: broadcast the signed command peer-to-peer via the light node
-    // (no trusted daemon). Same signed transaction, different delivery — the canonical
-    // tx hash is identical to the daemon path's (it excludes the signature).
-    if let Some(light_node) = &self.light_node {
-      let user_command = self.signed_user_command(&signed_transaction)?;
-      let mut bytes = Vec::new();
-      user_command
-        .binprot_write(&mut bytes)
-        .map_err(|e| MinaMeshError::Exception(format!("binprot encode user command: {e}")))?;
-      let outcome = light_node.submit(&hex::encode(bytes)).await?;
-      self.cache_transaction(&signed_transaction.signature);
-      tracing::info!("Broadcast via light node; tx hash: {}", outcome.tx_id);
-      return Ok(TransactionIdentifierResponse::new(TransactionIdentifier::new(outcome.tx_id)));
-    }
+    // The on-wire binprot hex is the gossip-topic format (light node) and is ignored by the
+    // daemon backend. The canonical tx hash excludes the signature, so both delivery paths
+    // yield the same hash.
+    let user_command = self.signed_user_command(&signed_transaction)?;
+    let mut bytes = Vec::new();
+    user_command
+      .binprot_write(&mut bytes)
+      .map_err(|e| MinaMeshError::Exception(format!("binprot encode user command: {e}")))?;
+    let tx_hex = hex::encode(bytes);
+    let signature = signed_transaction.signature.clone();
 
-    // tracing::debug!("CACHE: {:?}", self.cache);
-    if signed_transaction.payment.is_some() {
+    if let Some(payment) = &signed_transaction.payment {
       tracing::info!("Payment transaction");
-      let payment = signed_transaction.payment.unwrap();
-      let hash = self.send_payment(payment, &signed_transaction.signature).await?;
-      self.cache_transaction(&signed_transaction.signature);
+      let result = self.node.submit_payment(&SignedPayment { payment, signature: &signature, tx_hex: &tx_hex }).await;
+      let hash = match result {
+        Ok(hash) => hash,
+        Err(e) => return Err(self.enrich_submit_error(e, &signature, Some(payment.clone())).await),
+      };
+      self.cache_transaction(&signature);
       tracing::info!("Success! Transaction hash: {}", hash);
       Ok(TransactionIdentifierResponse::new(TransactionIdentifier::new(hash)))
-    } else if signed_transaction.stake_delegation.is_some() {
+    } else if let Some(delegation) = &signed_transaction.stake_delegation {
       tracing::info!("Stake delegation transaction");
-      let delegation = signed_transaction.stake_delegation.unwrap();
-      let hash = self.send_delegation(delegation, &signed_transaction.signature).await?;
-      self.cache_transaction(&signed_transaction.signature);
+      let result =
+        self.node.submit_delegation(&SignedDelegation { delegation, signature: &signature, tx_hex: &tx_hex }).await;
+      let hash = match result {
+        Ok(hash) => hash,
+        Err(e) => return Err(self.enrich_submit_error(e, &signature, None).await),
+      };
+      self.cache_transaction(&signature);
       tracing::info!("Success! Transaction hash: {}", hash);
-
       Ok(TransactionIdentifierResponse::new(TransactionIdentifier::new(hash.to_string())))
     } else {
       tracing::debug!("Signed transaction missing payment or stake delegation");
-      return Err(MinaMeshError::JsonParse(Some("Signed transaction missing payment or stake delegation".to_string())));
+      Err(MinaMeshError::JsonParse(Some("Signed transaction missing payment or stake delegation".to_string())))
     }
   }
 
-  async fn send_payment(&self, payment: Payment, signature: &str) -> Result<String, MinaMeshError> {
-    let payment_clone = payment.clone();
-    let variables = SendPaymentVariables {
-      amount: payment.amount.into(),
-      fee: payment.fee.into(),
-      from: payment.from.into(),
-      to: payment.to.into(),
-      nonce: payment.nonce.into(),
-      valid_until: payment.valid_until.map(|v| v.into()),
-      memo: payment.memo.as_deref(),
-      signature,
-    };
-
-    let response = self.graphql_client.send(SendPayment::build(variables)).await;
-
-    match response {
-      Ok(response) => Ok(response.send_payment.payment.hash.0),
-      Err(err) => Err(self.map_error(err, signature, Some(payment_clone)).await),
+  /// Refine a submit error with cache/DB duplicate detection. The `DaemonBackend` already
+  /// maps the raw GraphQL error strings onto `TransactionSubmit*`; here we add the
+  /// duplicate-vs-bad-nonce disambiguation that needs MinaMesh's cache and archive. Only the
+  /// trusted daemon produces these structured submit errors — the light node's peer-to-peer
+  /// submit doesn't, so this is a no-op for `Provenance::Verified`.
+  async fn enrich_submit_error(
+    &self,
+    err: MinaMeshError,
+    signed_tx_str: &str,
+    payment: Option<Payment>,
+  ) -> MinaMeshError {
+    if self.node.provenance() != Provenance::TrustedDaemon {
+      return err;
     }
-  }
-
-  async fn send_delegation(&self, delegation: StakeDelegation, signature: &str) -> Result<String, MinaMeshError> {
-    let variables = SendDelegationVariables {
-      fee: delegation.fee.into(),
-      from: delegation.delegator.into(),
-      to: delegation.new_delegate.into(),
-      nonce: delegation.nonce.into(),
-      valid_until: delegation.valid_until.map(|v| v.into()),
-      memo: delegation.memo.as_deref(),
-      signature,
-    };
-
-    let response = self.graphql_client.send(SendDelegation::build(variables)).await;
-
-    match response {
-      Ok(response) => Ok(response.send_delegation.delegation.hash.0),
-      Err(err) => Err(self.map_error(err, signature, None).await),
-    }
-  }
-
-  async fn map_error(&self, err: MinaMeshError, signed_tx_str: &str, payment: Option<Payment>) -> MinaMeshError {
-    match err {
-      MinaMeshError::GraphqlMinaQuery(err) => {
-        if err.contains("Couldn't infer nonce") {
-          MinaMeshError::TransactionSubmitNoSender(err)
-        } else if err.contains("less than the minimum fee") {
-          MinaMeshError::TransactionSubmitFeeSmall(err)
-        } else if err.contains("Invalid_signature") {
-          MinaMeshError::TransactionSubmitInvalidSignature(err)
-        } else if err.contains("below minimum_nonce") {
-          if self.is_transaction_cached(signed_tx_str) {
-            return MinaMeshError::TransactionSubmitDuplicate(err);
-          }
-
-          if let Some(payment) = payment {
-            if self.is_transaction_in_db(payment).await.unwrap_or(false) {
-              return MinaMeshError::TransactionSubmitDuplicate("Transaction already in database".to_string());
-            }
-          }
-
-          MinaMeshError::TransactionSubmitBadNonce(err)
-        } else if err.contains("Insufficient_funds") {
-          MinaMeshError::TransactionSubmitInsufficientBalance(err)
-        } else if err.contains("Expired") {
-          MinaMeshError::TransactionSubmitExpired(err)
-        } else {
-          MinaMeshError::GraphqlMinaQuery(err)
+    if let MinaMeshError::TransactionSubmitBadNonce(ref msg) = err {
+      if self.is_transaction_cached(signed_tx_str) {
+        return MinaMeshError::TransactionSubmitDuplicate(msg.clone());
+      }
+      if let Some(payment) = payment {
+        if self.is_transaction_in_db(payment).await.unwrap_or(false) {
+          return MinaMeshError::TransactionSubmitDuplicate("Transaction already in database".to_string());
         }
       }
-      _ => err,
     }
+    err
   }
 
   async fn is_transaction_in_db(&self, payment: Payment) -> Result<bool, MinaMeshError> {
