@@ -10,6 +10,9 @@
 //! `account_nonce`). It is the third `MinaArchive` implementation, alongside
 //! [`crate::IndexerArchive`] and [`crate::PostgresArchive`].
 //!
+//! Closing these gaps (so this backend reaches parity with the indexer / raw-SQL paths) is
+//! tracked upstream in o1-labs/Archive-Node-API#200.
+//!
 //! Degradations vs the Postgres archive, all driven by what the API exposes:
 //!   * block lookup by **state hash** is unsupported (`BlockQueryInput` has no `stateHash`);
 //!   * only **canonical** blocks are served (pending-tip blocks return "not found");
@@ -279,6 +282,7 @@ impl MinaArchive for ArchiveNodeApiArchive {
   async fn block(&self, partial: &PartialBlockIdentifier) -> Result<BlockResponse, MinaMeshError> {
     let block = match (&partial.hash, partial.index) {
       // The API's `BlockQueryInput` has no `stateHash` filter, so hash lookups aren't possible.
+      // Tracked upstream: o1-labs/Archive-Node-API#200.
       (Some(_), _) => {
         return Err(MinaMeshError::Exception(
           "archive-node-api backend cannot look up a block by state hash (query by index instead)".to_string(),
@@ -297,6 +301,7 @@ impl MinaArchive for ArchiveNodeApiArchive {
     _metadata: Option<serde_json::Value>,
     _partial: &PartialBlockIdentifier,
   ) -> Result<AccountBalanceResponse, MinaMeshError> {
+    // Needs a historical ledger-account query — tracked upstream: o1-labs/Archive-Node-API#200.
     Err(MinaMeshError::Exception(
       "archive-node-api backend does not expose ledger account state; historical balance is unsupported".to_string(),
     ))
@@ -306,12 +311,14 @@ impl MinaArchive for ArchiveNodeApiArchive {
     &self,
     _req: &SearchTransactionsRequest,
   ) -> Result<SearchTransactionsResponse, MinaMeshError> {
+    // Needs an account-scoped transaction query — tracked upstream: o1-labs/Archive-Node-API#200.
     Err(MinaMeshError::Exception(
       "archive-node-api backend does not support account-scoped transaction search".to_string(),
     ))
   }
 
   async fn account_nonce(&self, _public_key: &str) -> Result<Option<u32>, MinaMeshError> {
+    // Needs an account/nonce query — tracked upstream: o1-labs/Archive-Node-API#200.
     Err(MinaMeshError::Exception(
       "archive-node-api backend does not expose account nonce; use the daemon (full mode)".to_string(),
     ))
