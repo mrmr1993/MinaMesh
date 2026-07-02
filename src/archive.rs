@@ -847,7 +847,7 @@ pub struct BlockMetadata {
 }
 
 /// Build a Rosetta transaction for one internal command (coinbase / fee transfer).
-fn internal_command_transaction(meta: &InternalCommandMetadata) -> Transaction {
+pub(crate) fn internal_command_transaction(meta: &InternalCommandMetadata) -> Transaction {
   let id = generate_internal_command_transaction_identifier(
     &meta.command_type,
     meta.sequence_no,

@@ -56,6 +56,13 @@ pub struct MinaMeshConfig {
   #[arg(long, env = "MINAMESH_INDEXER_URL")]
   pub indexer_url: Option<String>,
 
+  /// Optional URL of an `Archive-Node-API` GraphQL server. When set (and no indexer is
+  /// configured), history reads are served from it instead of a Postgres archive. It is a
+  /// **partial** backend: it serves `/block` (by index) + oldest/tip, but not historical
+  /// balance, search, or construction nonce. See [`crate::ArchiveNodeApiArchive`].
+  #[arg(long, env = "MINAMESH_ARCHIVE_NODE_API_URL")]
+  pub archive_node_api_url: Option<String>,
+
   /// Network name (e.g. `devnet`, `mainnet`). In trustless mode (indexer set) this is the
   /// source of truth for `/network/list` + network validation and the genesis identifier is
   /// taken from the indexer — so no Mina daemon GraphQL (`proxy_url`) is needed at all.
@@ -76,16 +83,20 @@ impl MinaMeshConfig {
   }
 
   pub async fn to_mina_mesh(self) -> Result<MinaMesh, MinaMeshError> {
-    // Select the history backend behind the `MinaArchive` trait:
-    //   indexer configured ⇒ trustless `IndexerArchive` (provenance Verified)
-    //   else               ⇒ trusted `PostgresArchive` over the archive database.
+    // Select the history backend behind the `MinaArchive` trait (first configured wins):
+    //   indexer         ⇒ trustless `IndexerArchive`      (provenance Verified)
+    //   archive-node-api ⇒ trusted `ArchiveNodeApiArchive` (provenance TrustedArchive, partial)
+    //   archive database ⇒ trusted `PostgresArchive`        (provenance TrustedArchive)
     let archive: Box<dyn crate::MinaArchive> = if let Some(url) = &self.indexer_url {
       tracing::info!("Trustless indexer archive enabled at {url}");
       Box::new(crate::IndexerArchive::new(crate::IndexerClient::new(url.to_owned())))
+    } else if let Some(url) = &self.archive_node_api_url {
+      tracing::info!("Archive-Node-API archive enabled at {url}");
+      Box::new(crate::ArchiveNodeApiArchive::new(crate::ArchiveNodeApiClient::new(url.to_owned())))
     } else {
       let url = self.archive_database_url.as_ref().ok_or_else(|| {
         MinaMeshError::Exception(
-          "set MINAMESH_INDEXER_URL or MINAMESH_ARCHIVE_DATABASE_URL (one backs historical reads)".to_string(),
+          "set MINAMESH_INDEXER_URL, MINAMESH_ARCHIVE_NODE_API_URL, or MINAMESH_ARCHIVE_DATABASE_URL (one backs historical reads)".to_string(),
         )
       })?;
       let pool = PgPoolOptions::new()
@@ -118,10 +129,11 @@ impl MinaMeshConfig {
         (Box::new(crate::DaemonBackend::new(client.clone())), Some(client))
       };
 
-    // Genesis identifier: from the trustless archive (indexer oldest) in trustless mode (no
-    // daemon), else the daemon.
-    let genesis_block_identifier = if archive.provenance() == crate::Provenance::Verified {
-      // The indexer may still be starting; retry briefly for its rooted genesis (oldest).
+    // Genesis identifier: from the standalone archive's oldest block when it backs history
+    // without a daemon (indexer or archive-node-api), else from the daemon (Postgres mode).
+    let archive_backs_genesis = self.indexer_url.is_some() || self.archive_node_api_url.is_some();
+    let genesis_block_identifier = if archive_backs_genesis {
+      // The archive may still be starting; retry briefly for its rooted genesis (oldest).
       let mut last = None;
       let mut found = None;
       for _ in 0..30 {
@@ -137,7 +149,7 @@ impl MinaMeshConfig {
         }
       }
       found
-        .ok_or_else(|| MinaMeshError::Exception(format!("indexer not reachable for genesis identifier: {last:?}")))?
+        .ok_or_else(|| MinaMeshError::Exception(format!("archive not reachable for genesis identifier: {last:?}")))?
     } else {
       // History from Postgres ⇒ genesis from the daemon. Only reachable in full mode, where
       // `daemon_client_for_genesis` is `Some`.

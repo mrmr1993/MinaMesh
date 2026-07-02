@@ -194,6 +194,7 @@ async fn test_conversion_from_cynic_reqwest_error() -> Result<(), MinaMeshError>
     use_search_tx_optimizations: false,
     light_node_url: None,
     indexer_url: None,
+    archive_node_api_url: None,
     network: "devnet".to_string(),
   }
   .to_mina_mesh()
@@ -222,6 +223,7 @@ async fn test_graphql_uri_not_set_error() -> Result<(), MinaMeshError> {
     use_search_tx_optimizations: false,
     light_node_url: None,
     indexer_url: None,
+    archive_node_api_url: None,
     network: "devnet".to_string(),
   }
   .to_mina_mesh()

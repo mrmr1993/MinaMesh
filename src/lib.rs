@@ -1,5 +1,6 @@
 mod api;
 mod archive;
+mod archive_node_api;
 mod commands;
 mod config;
 mod create_router;
@@ -20,6 +21,7 @@ pub mod util;
 use std::time::{Duration, Instant};
 
 pub use archive::*;
+pub use archive_node_api::*;
 pub use coinbase_mesh::models;
 use coinbase_mesh::models::BlockIdentifier;
 pub use commands::*;
