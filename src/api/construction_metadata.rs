@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 
 use crate::{
   create_currency, graphql::Block3, signer_utils::validate_base58_with_checksum, util::MINIMUM_USER_COMMAND_FEE,
-  DaemonBackend, MinaMesh, MinaMeshError, TransactionMetadata,
+  DaemonBackend, MinaMesh, MinaMeshError, Provenance, TransactionMetadata,
 };
 
 /// https://github.com/MinaProtocol/mina/blob/985eda49bdfabc046ef9001d3c406e688bc7ec45/src/app/rosetta/lib/construction.ml#L133
@@ -29,16 +29,17 @@ impl MinaMesh {
 
     let token_id = self.get_field_from_options(options, "token_id")?;
 
-    // Trustless mode: current nonce + receiver existence from the indexer; fees from
-    // constants (no Mina daemon). The account-creation fee is the protocol constant 1 MINA.
-    if let Some(indexer) = &self.indexer {
+    // Trustless mode: current nonce + receiver existence from the (indexer) history axis; fees
+    // from constants (no Mina daemon). The account-creation fee is the protocol constant 1 MINA.
+    if self.archive.provenance() == Provenance::Verified {
       const ACCOUNT_CREATION_FEE: u64 = 1_000_000_000;
-      let inferred_nonce = indexer
+      let inferred_nonce = self
+        .archive
         .account_nonce(sender)
         .await?
         .ok_or_else(|| MinaMeshError::AccountNotFound(format!("Sender account not found: {sender}")))?
         .to_string();
-      let receiver_exists = indexer.account_nonce(receiver).await?.is_some();
+      let receiver_exists = self.archive.account_nonce(receiver).await?.is_some();
       let account_creation_fee = (!receiver_exists).then(|| ACCOUNT_CREATION_FEE.to_string());
       let valid_until = options.get("valid_until").and_then(|v| v.as_str());
       let memo = options.get("memo").and_then(|v| v.as_str());

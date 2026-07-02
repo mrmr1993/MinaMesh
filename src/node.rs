@@ -28,9 +28,12 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provenance {
   /// Light node: SNARK-verified blocks, Merkle-proved balances, signature-checked mempool.
+  /// Also the trustless history axis (`mina-indexer`: SNARK-gated ingestion).
   Verified,
   /// Full mode: you operate the node and trust it.
   TrustedDaemon,
+  /// A raw Mina archive Postgres you operate — trusted history, not proof-verified.
+  TrustedArchive,
 }
 
 /// The live best/verified tip plus sync progress. Genesis and the *oldest* block are

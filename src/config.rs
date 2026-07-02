@@ -76,26 +76,26 @@ impl MinaMeshConfig {
   }
 
   pub async fn to_mina_mesh(self) -> Result<MinaMesh, MinaMeshError> {
-    let indexer = self.indexer_url.as_ref().map(|url| {
-      tracing::info!("Trustless indexer backend enabled at {url}");
-      crate::IndexerClient::new(url.to_owned())
-    });
-    // The archive Postgres is required only when the indexer isn't serving history.
-    if indexer.is_none() && self.archive_database_url.is_none() {
-      return Err(MinaMeshError::Exception(
-        "set MINAMESH_INDEXER_URL or MINAMESH_ARCHIVE_DATABASE_URL (one backs historical reads)".to_string(),
-      ));
-    }
-    let pg_pool = match &self.archive_database_url {
-      Some(url) => Some(
-        PgPoolOptions::new()
-          .max_connections(self.max_db_pool_size)
-          .min_connections(0)
-          .idle_timeout(Duration::from_secs(self.db_pool_idle_timeout))
-          .connect(url.as_str())
-          .await?,
-      ),
-      None => None,
+    // Select the history backend behind the `MinaArchive` trait:
+    //   indexer configured ⇒ trustless `IndexerArchive` (provenance Verified)
+    //   else               ⇒ trusted `PostgresArchive` over the archive database.
+    let archive: Box<dyn crate::MinaArchive> = if let Some(url) = &self.indexer_url {
+      tracing::info!("Trustless indexer archive enabled at {url}");
+      Box::new(crate::IndexerArchive::new(crate::IndexerClient::new(url.to_owned())))
+    } else {
+      let url = self.archive_database_url.as_ref().ok_or_else(|| {
+        MinaMeshError::Exception(
+          "set MINAMESH_INDEXER_URL or MINAMESH_ARCHIVE_DATABASE_URL (one backs historical reads)".to_string(),
+        )
+      })?;
+      let pool = PgPoolOptions::new()
+        .max_connections(self.max_db_pool_size)
+        .min_connections(0)
+        .idle_timeout(Duration::from_secs(self.db_pool_idle_timeout))
+        .connect(url.as_str())
+        .await?;
+      tracing::info!("Trusted Postgres archive at {url}");
+      Box::new(crate::PostgresArchive::new(pool, self.use_search_tx_optimizations))
     };
     // `mina:<network>` — the Rosetta network id this server validates against.
     let network_id = format!("mina:{}", self.network);
@@ -118,15 +118,16 @@ impl MinaMeshConfig {
         (Box::new(crate::DaemonBackend::new(client.clone())), Some(client))
       };
 
-    // Genesis identifier: from the indexer in trustless mode (no daemon), else the daemon.
-    let genesis_block_identifier = if let Some(indexer) = &indexer {
+    // Genesis identifier: from the trustless archive (indexer oldest) in trustless mode (no
+    // daemon), else the daemon.
+    let genesis_block_identifier = if archive.provenance() == crate::Provenance::Verified {
       // The indexer may still be starting; retry briefly for its rooted genesis (oldest).
       let mut last = None;
       let mut found = None;
       for _ in 0..30 {
-        match indexer.oldest().await {
+        match archive.oldest_block_identifier().await {
           Ok(g) => {
-            found = Some(BlockIdentifier::new(g.block_height as i64, g.state_hash));
+            found = Some(g);
             break;
           }
           Err(e) => {
@@ -150,14 +151,12 @@ impl MinaMeshConfig {
 
     Ok(MinaMesh {
       node,
+      archive,
       network_id,
-      pg_pool,
       genesis_block_identifier,
-      search_tx_optimized: self.use_search_tx_optimizations,
       cache: DashMap::new(),
       cache_ttl: Duration::from_secs(300),
       cache_tx_size: 100, // Cache limit for last n transactions submitted
-      indexer,
     })
   }
 }

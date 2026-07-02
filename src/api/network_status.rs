@@ -2,19 +2,21 @@
 
 use coinbase_mesh::models::{BlockIdentifier, NetworkRequest, NetworkStatusResponse, Peer, SyncStatus};
 
-use crate::{MinaMesh, MinaMeshError};
+use crate::{MinaMesh, MinaMeshError, Provenance};
 
 /// https://github.com/MinaProtocol/mina/blob/985eda49bdfabc046ef9001d3c406e688bc7ec45/src/app/rosetta/lib/network.ml#L201
 impl MinaMesh {
   pub async fn network_status(&self, req: NetworkRequest) -> Result<NetworkStatusResponse, MinaMeshError> {
     self.validate_network(&req.network_identifier).await?;
 
-    // Trustless mode: current tip + oldest from the indexer; sync target from the node's
-    // verified network tip (the light-node backend). No Mina daemon GraphQL.
-    if let Some(indexer) = &self.indexer {
-      let tip = indexer.tip().await?;
-      let oldest = indexer.oldest().await?;
-      let current_index = tip.block_height as i64;
+    // The oldest block (archive availability floor) is a history-axis read in every mode.
+    let oldest_block_identifier = self.archive.oldest_block_identifier().await?;
+
+    // Trustless mode: current tip comes from the (indexer) history axis; the sync target is
+    // the node's verified network tip (the light-node backend). No Mina daemon GraphQL.
+    if self.archive.provenance() == Provenance::Verified {
+      let tip = self.archive.tip().await?;
+      let current_index = tip.block_identifier.index;
       // Sync target = the node's proof-verified network tip. While the indexer backfills,
       // current < target ⇒ not yet synced.
       let target_index = self.node.status().await.map(|s| s.block_height).unwrap_or(current_index);
@@ -22,10 +24,10 @@ impl MinaMesh {
       return Ok(NetworkStatusResponse {
         // The light node holds a peer mesh but exposes only a count, not Rosetta Peer ids.
         peers: Some(vec![]),
-        current_block_identifier: Box::new(BlockIdentifier::new(current_index, tip.state_hash)),
-        current_block_timestamp: tip.protocol_state.blockchain_state.utc_date.parse::<i64>()?,
+        current_block_identifier: Box::new(tip.block_identifier),
+        current_block_timestamp: tip.timestamp,
         genesis_block_identifier: Box::new(self.genesis_block_identifier.clone()),
-        oldest_block_identifier: Some(Box::new(BlockIdentifier::new(oldest.block_height as i64, oldest.state_hash))),
+        oldest_block_identifier: Some(Box::new(oldest_block_identifier)),
         sync_status: Some(Box::new(SyncStatus {
           current_index: Some(current_index),
           target_index: Some(target_index),
@@ -37,9 +39,6 @@ impl MinaMesh {
 
     // Full mode: the live tip + peers + sync come from the node (daemon) via the trait.
     let status = self.node.status().await?;
-    // The archive availability floor comes from the Postgres archive.
-    let oldest_block = sqlx::query_file!("sql/queries/oldest_block.sql").fetch_one(self.pg()?).await?;
-    let oldest_block_identifier = BlockIdentifier::new(oldest_block.height, oldest_block.state_hash);
     let sync =
       status.sync.map(|s| SyncStatus { stage: s.stage, synced: s.synced, current_index: None, target_index: None });
     Ok(NetworkStatusResponse {
