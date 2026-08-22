@@ -712,7 +712,18 @@ impl MinaArchive for PostgresArchive {
           None => last_relevant_command_balance,
         };
         let total_balance = last_relevant_command_balance;
-        let locked_balance = total_balance - liquid_balance;
+        // `liquid_balance` above can exceed `total_balance`: it adds the amount that vested
+        // between the last command and the requested block to a total that already includes it,
+        // so it overshoots by the minimum balance owed at the earlier slot. That makes this
+        // subtraction underflow, and u64 underflow wraps in release builds -- the response then
+        // reports a `locked_balance` near u64::MAX. Saturating keeps the reported figure sane.
+        //
+        // This does not fix the overshoot itself, only its most visible consequence. The correct
+        // liquid balance is `total_balance - min_balance_at_slot(requested_slot)`, but the OCaml
+        // implementation this is ported from computes it the same way, so changing it would
+        // diverge from the reference that tests/compare_to_ocaml.rs checks against. That is a
+        // call for the maintainers rather than a drive-by fix.
+        let locked_balance = total_balance.saturating_sub(liquid_balance);
         Ok(AccountBalanceResponse {
           block_identifier: Box::new(build_block_identifier(block.height, block.state_hash, index, hash)?),
           balances: vec![Amount {
@@ -1085,11 +1096,11 @@ fn min_balance_at_slot(
       0
     } else {
       let num_periods = (global_slot - cliff_time) / vesting_period;
-      let vesting_decrement = if (u64::MAX / num_periods as u64) < vesting_increment {
-        u64::MAX
-      } else {
-        num_periods as u64 * vesting_increment
-      };
+      // Saturate rather than divide to test for overflow: `num_periods` is zero for any slot
+      // in the first vesting period after the cliff, and dividing by it panics. The OCaml this
+      // is ported from guards the same division with `try ... with Division_by_zero -> false`,
+      // which takes the multiplying branch and yields a zero decrement.
+      let vesting_decrement = (num_periods as u64).checked_mul(vesting_increment).unwrap_or(u64::MAX);
       min_balance_past_cliff.saturating_sub(vesting_decrement)
     }
   }
@@ -1130,4 +1141,61 @@ fn build_block_identifier(
     hash: db_hash.clone().ok_or(MinaMeshError::BlockMissing(index, hash.clone()))?,
     index: db_height.ok_or(MinaMeshError::BlockMissing(index, hash))?,
   })
+}
+
+#[cfg(test)]
+mod vesting_tests {
+  use super::{incremental_balance_between_slots, min_balance_at_slot};
+
+  // A timed account queried anywhere in the first vesting period after its cliff gives
+  // `num_periods == 0`. Nothing has vested yet, so the whole post-cliff minimum is still locked.
+  #[test]
+  fn min_balance_at_the_cliff_slot() {
+    assert_eq!(min_balance_at_slot(1000, 1000, 100, 10, 5, 1000), 900);
+  }
+
+  #[test]
+  fn min_balance_within_the_first_vesting_period() {
+    assert_eq!(min_balance_at_slot(1009, 1000, 100, 10, 5, 1000), 900);
+  }
+
+  #[test]
+  fn min_balance_vests_by_one_increment_per_period() {
+    assert_eq!(min_balance_at_slot(1010, 1000, 100, 10, 5, 1000), 895);
+    assert_eq!(min_balance_at_slot(1020, 1000, 100, 10, 5, 1000), 890);
+  }
+
+  #[test]
+  fn min_balance_before_the_cliff_is_the_initial_minimum() {
+    assert_eq!(min_balance_at_slot(999, 1000, 100, 10, 5, 1000), 1000);
+  }
+
+  #[test]
+  fn min_balance_is_zero_once_fully_vested() {
+    assert_eq!(min_balance_at_slot(100_000, 1000, 100, 10, 5, 1000), 0);
+  }
+
+  // A vesting increment large enough to overflow the multiplication must saturate, not wrap.
+  #[test]
+  fn min_balance_saturates_on_a_huge_vesting_increment() {
+    assert_eq!(min_balance_at_slot(1020, 1000, 100, 10, u64::MAX, 1000), 0);
+  }
+
+  #[test]
+  fn incremental_balance_across_the_cliff_slot() {
+    assert_eq!(incremental_balance_between_slots(1000, 1010, 1000, 100, 10, 5, 1000), 5);
+  }
+
+  // The liquid balance is built as `balance + incremental` while the total is `balance` alone,
+  // so a vesting account reports liquid above total and the locked subtraction underflows.
+  #[test]
+  fn locked_balance_saturates_instead_of_wrapping() {
+    let balance: u64 = 1_000;
+    let incremental = incremental_balance_between_slots(1010, 1020, 1000, 100, 10, 5, 1000);
+    assert!(incremental > 0);
+    let liquid = balance + incremental;
+    assert!(liquid > balance);
+    assert_eq!(balance.saturating_sub(liquid), 0);
+    assert_eq!(balance.wrapping_sub(liquid), u64::MAX - 4);
+  }
 }
