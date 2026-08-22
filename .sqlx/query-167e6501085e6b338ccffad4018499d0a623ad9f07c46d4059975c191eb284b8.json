@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "-- As with maybe_account_balance_info.sql, the addressable blocks are the canonical chain plus the\n-- single pending branch descending from the best tip -- not every pending block at a given height.\n-- Resolving a bare height during a fork would otherwise return an arbitrary one of the competing\n-- branches.\nWITH RECURSIVE\n  pending_chain AS (\n    (\n      SELECT\n        id,\n        parent_id,\n        height,\n        state_hash,\n        global_slot_since_genesis,\n        chain_status\n      FROM\n        blocks\n      WHERE\n        height=(\n          SELECT\n            max(height)\n          FROM\n            blocks\n        )\n      ORDER BY\n        TIMESTAMP ASC,\n        state_hash ASC\n      LIMIT\n        1\n    )\n    UNION ALL\n    SELECT\n      b.id,\n      b.parent_id,\n      b.height,\n      b.state_hash,\n      b.global_slot_since_genesis,\n      b.chain_status\n    FROM\n      blocks b\n      INNER JOIN pending_chain ON b.id=pending_chain.parent_id\n      AND pending_chain.id<>pending_chain.parent_id\n      AND pending_chain.chain_status<>'canonical'\n  ),\n  full_chain AS (\n    SELECT\n      height,\n      state_hash,\n      global_slot_since_genesis\n    FROM\n      pending_chain\n    UNION ALL\n    SELECT\n      height,\n      state_hash,\n      global_slot_since_genesis\n    FROM\n      blocks\n    WHERE\n      chain_status='canonical'\n  )\nSELECT DISTINCT\n  height,\n  state_hash,\n  global_slot_since_genesis\nFROM\n  full_chain\nWHERE\n  (\n    height=$1\n    OR $1 IS NULL\n  )\n  AND (\n    state_hash=$2\n    OR $2 IS NULL\n  )\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "height",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "state_hash",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "global_slot_since_genesis",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "167e6501085e6b338ccffad4018499d0a623ad9f07c46d4059975c191eb284b8"
+}
