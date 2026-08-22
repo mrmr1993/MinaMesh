@@ -54,7 +54,11 @@ WITH
       INNER JOIN zkapp_fee_payer_body AS zfpb ON zc.zkapp_fee_payer_body_id=zfpb.id
       INNER JOIN public_keys AS pk_fee_payer ON zfpb.public_key_id=pk_fee_payer.id
       INNER JOIN blocks AS b ON bzc.block_id=b.id
-      LEFT JOIN zkapp_account_update AS zau ON zau.id=ANY (zc.zkapp_account_updates_ids)
+      /* An account update id can appear more than once in the array and the ledger applies it
+         once per occurrence, so enumerate positionally rather than with `= ANY (...)`, which
+         collapses repeats and silently drops their balance changes. */
+      LEFT JOIN LATERAL unnest(zc.zkapp_account_updates_ids) WITH ORDINALITY AS au_ref (au_id, au_ord) ON TRUE
+      LEFT JOIN zkapp_account_update AS zau ON zau.id=au_ref.au_id
       INNER JOIN zkapp_account_update_body AS zaub ON zau.body_id=zaub.id
       INNER JOIN account_identifiers AS ai_update_body ON zaub.account_identifier_id=ai_update_body.id
       INNER JOIN public_keys AS pk_update_body ON ai_update_body.public_key_id=pk_update_body.id
