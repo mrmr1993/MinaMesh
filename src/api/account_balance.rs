@@ -83,7 +83,19 @@ impl MinaMesh {
           None => last_relevant_command_balance,
         };
         let total_balance = last_relevant_command_balance;
-        let locked_balance = total_balance - liquid_balance;
+        // `liquid_balance` above can exceed `total_balance`: it adds the amount that vested
+        // between the last command and the requested block to a total that already includes it,
+        // so it overshoots by the minimum balance owed at the earlier slot. That makes this
+        // subtraction underflow, and u64 underflow wraps in release builds -- the response then
+        // reports a `locked_balance` near u64::MAX. Saturating keeps the reported figure sane.
+        //
+        // This does not fix the overshoot itself, only its most visible consequence. The
+        // correct liquid balance is `total_balance - min_balance_at_slot(requested_slot)`, but
+        // the OCaml implementation this file is ported from computes it the same way (see
+        // `src/app/rosetta/lib/account.ml`, where the equivalent `UInt64.sub` wraps silently),
+        // so changing it would diverge from the reference that `tests/compare_to_ocaml.rs`
+        // checks against. That is a call for the maintainers rather than a drive-by fix.
+        let locked_balance = total_balance.saturating_sub(liquid_balance);
         Ok(AccountBalanceResponse {
           block_identifier: Box::new(build_block_identifier(block.height, block.state_hash, index, hash)?),
           balances: vec![Amount {
@@ -216,4 +228,29 @@ fn build_block_identifier(
     hash: db_hash.clone().ok_or(MinaMeshError::BlockMissing(index, hash.clone()))?,
     index: db_height.ok_or(MinaMeshError::BlockMissing(index, hash))?,
   })
+}
+
+#[cfg(test)]
+mod tests {
+  use super::incremental_balance_between_slots;
+
+  // The liquid balance is built as `balance + incremental`, while the total is `balance` alone.
+  // Any account that vested between its last command and the requested block therefore reports a
+  // liquid balance above its total, which is what makes the locked-balance subtraction underflow.
+  #[test]
+  fn liquid_balance_can_exceed_total_balance() {
+    let balance: u64 = 1_000;
+    // Slots deliberately past the first vesting period: at the cliff itself the helper panics,
+    // which is a separate defect fixed on its own branch.
+    let incremental = incremental_balance_between_slots(1010, 1020, 1000, 100, 10, 5, 1000);
+    assert!(incremental > 0, "vesting must have progressed for this to be the interesting case");
+
+    let liquid = balance + incremental;
+    let total = balance;
+    assert!(liquid > total);
+
+    // Wrapping would report ~1.8e19 here.
+    assert_eq!(total.saturating_sub(liquid), 0);
+    assert_eq!(total.wrapping_sub(liquid), u64::MAX - 4);
+  }
 }
