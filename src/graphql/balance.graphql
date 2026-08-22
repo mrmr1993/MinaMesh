@@ -1,5 +1,5 @@
-query QueryBalance($publicKey: PublicKey!) {
-  account(publicKey: $publicKey) {
+query QueryBalance($publicKey: PublicKey!, $token: TokenId) {
+  account(publicKey: $publicKey, token: $token) {
     balance {
       blockHeight
       stateHash

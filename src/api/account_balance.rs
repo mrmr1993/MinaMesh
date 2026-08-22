@@ -19,7 +19,7 @@ impl MinaMesh {
     let AccountIdentifier { address, metadata, .. } = *req.account_identifier;
     match req.block_identifier {
       Some(block_identifier) => self.block_balance(address, metadata, *block_identifier).await,
-      None => self.frontier_balance(address).await,
+      None => self.frontier_balance(address, metadata).await,
     }
   }
 
@@ -104,10 +104,20 @@ impl MinaMesh {
     }
   }
 
-  async fn frontier_balance(&self, public_key: String) -> Result<AccountBalanceResponse, MinaMeshError> {
+  async fn frontier_balance(
+    &self,
+    public_key: String,
+    metadata: Option<serde_json::Value>,
+  ) -> Result<AccountBalanceResponse, MinaMeshError> {
+    // Without a token the daemon returns the MINA account, so a request naming a custom token
+    // would otherwise be answered with the wrong account's balance.
+    let token = Wrapper(metadata).token_id_or_default()?;
     let result = self
       .graphql_client
-      .send(QueryBalance::build(QueryBalanceVariables { public_key: public_key.clone().into() }))
+      .send(QueryBalance::build(QueryBalanceVariables {
+        public_key: public_key.clone().into(),
+        token: Some(token.clone().into()),
+      }))
       .await?;
     if let QueryBalance {
       account:
