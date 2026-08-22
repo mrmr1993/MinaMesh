@@ -351,13 +351,19 @@ impl TryFrom<SearchTransactionsRequest> for SearchTransactionsQueryParams {
   fn try_from(req: SearchTransactionsRequest) -> Result<Self, Self::Error> {
     let max_block = req.max_block;
     let transaction_hash = req.transaction_identifier.map(|t| t.hash);
-    // token_id can be found in the metadata of the account_identifier
-    let token_id = req
-      .account_identifier
-      .as_ref()
-      .and_then(|a| a.metadata.as_ref())
-      .and_then(|m| m.get("token_id"))
-      .map(|t| t.as_str().unwrap().to_string());
+    // token_id can be found in the metadata of the account_identifier. A caller can put
+    // anything in there, so a non-string must be rejected rather than unwrapped -- as the
+    // status handling below already does for its own bad input.
+    let token_id =
+      match req.account_identifier.as_ref().and_then(|a| a.metadata.as_ref()).and_then(|m| m.get("token_id")) {
+        None => None,
+        Some(serde_json::Value::String(token)) => Some(token.clone()),
+        Some(other) => {
+          return Err(MinaMeshError::JsonParse(Some(format!(
+            "account_identifier.metadata.token_id must be a string, got {other}"
+          ))));
+        }
+      };
     let account_identifier = req.account_identifier.map(|a| a.address);
 
     let status = match req.status.as_deref() {
@@ -404,4 +410,45 @@ fn adjust_limit_and_offset(mut limit: i64, mut offset: i64, txs_len: i64) -> (i6
     limit = 0;
   }
   (offset, limit)
+}
+
+#[cfg(test)]
+mod tests {
+  use coinbase_mesh::models::{AccountIdentifier, NetworkIdentifier, SearchTransactionsRequest};
+  use serde_json::json;
+
+  use super::SearchTransactionsQueryParams;
+
+  fn request(metadata: Option<serde_json::Value>) -> SearchTransactionsRequest {
+    SearchTransactionsRequest {
+      network_identifier: Box::new(NetworkIdentifier::new("mina".to_string(), "testnet".to_string())),
+      account_identifier: Some(Box::new(AccountIdentifier {
+        address: "B62qaddress".to_string(),
+        sub_account: None,
+        metadata,
+      })),
+      ..Default::default()
+    }
+  }
+
+  #[test]
+  fn a_string_token_id_is_read() {
+    let params = SearchTransactionsQueryParams::try_from(request(Some(json!({ "token_id": "wSHV2" })))).unwrap();
+    assert_eq!(params.token_id.as_deref(), Some("wSHV2"));
+  }
+
+  #[test]
+  fn absent_metadata_or_token_id_means_no_filter() {
+    assert!(SearchTransactionsQueryParams::try_from(request(None)).unwrap().token_id.is_none());
+    assert!(SearchTransactionsQueryParams::try_from(request(Some(json!({})))).unwrap().token_id.is_none());
+  }
+
+  // Previously `as_str().unwrap()`, so any of these panicked the request handler.
+  #[test]
+  fn a_non_string_token_id_is_an_error_not_a_panic() {
+    for value in [json!(123), json!(null), json!(["wSHV2"]), json!({ "nested": true })] {
+      let result = SearchTransactionsQueryParams::try_from(request(Some(json!({ "token_id": value }))));
+      assert!(result.is_err(), "expected an error for token_id = {value}");
+    }
+  }
 }
