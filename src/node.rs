@@ -23,17 +23,18 @@ use crate::{
   UserCommandType,
 };
 
-/// How the caller knows a node response is true. This **must not** be flattened away —
+/// How the caller knows a *node* response is true. This **must not** be flattened away —
 /// it is the contract a verifiable-indexer proof envelope later rides on.
+///
+/// History has its own axis, [`crate::ArchiveProvenance`]. They are deliberately separate
+/// types: a node cannot be backed by an archive and an archive cannot be backed by a daemon,
+/// so one enum spanning both would let either report a provenance it cannot have.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Provenance {
+pub enum NodeProvenance {
   /// Light node: SNARK-verified blocks, Merkle-proved balances, signature-checked mempool.
-  /// Also the trustless history axis (`mina-indexer`: SNARK-gated ingestion).
   Verified,
-  /// Full mode: you operate the node and trust it.
-  TrustedDaemon,
-  /// A raw Mina archive Postgres you operate — trusted history, not proof-verified.
-  TrustedArchive,
+  /// Full daemon: you operate the node and trust it.
+  Trusted,
 }
 
 /// The live best/verified tip plus sync progress. Genesis and the *oldest* block are
@@ -184,7 +185,7 @@ pub trait MinaNode: Send + Sync {
   async fn submit_delegation(&self, d: &SignedDelegation<'_>) -> Result<String, MinaMeshError>;
 
   /// How the caller knows these responses are true — must NOT be flattened away.
-  fn provenance(&self) -> Provenance;
+  fn provenance(&self) -> NodeProvenance;
 
   /// Escape hatch for the few daemon-only queries that are **not** part of the unified live
   /// surface (today: `construction/metadata`'s best-chain suggested-fee + genesis
@@ -286,8 +287,8 @@ impl MinaNode for LightNodeBackend {
     Ok(self.client.submit(d.tx_hex).await?.tx_id)
   }
 
-  fn provenance(&self) -> Provenance {
-    Provenance::Verified
+  fn provenance(&self) -> NodeProvenance {
+    NodeProvenance::Verified
   }
 
   fn as_any(&self) -> &dyn std::any::Any {
@@ -465,8 +466,8 @@ impl MinaNode for DaemonBackend {
       .map_err(Self::map_submit_error)
   }
 
-  fn provenance(&self) -> Provenance {
-    Provenance::TrustedDaemon
+  fn provenance(&self) -> NodeProvenance {
+    NodeProvenance::Trusted
   }
 
   fn as_any(&self) -> &dyn std::any::Any {

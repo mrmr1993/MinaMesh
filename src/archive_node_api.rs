@@ -31,9 +31,9 @@ use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::json;
 
 use crate::{
-  archive::internal_command_transaction, generate_operations_user_command, generate_transaction_metadata, ArchiveTip,
-  InternalCommandMetadata, InternalCommandType, MinaArchive, MinaMeshError, Payment, Provenance, TransactionStatus,
-  UserCommandMetadata, UserCommandType,
+  archive::internal_command_transaction, generate_operations_user_command, generate_transaction_metadata,
+  ArchiveProvenance, ArchiveTip, InternalCommandMetadata, InternalCommandType, MinaArchive, MinaMeshError, Payment,
+  TransactionStatus, UserCommandMetadata, UserCommandType,
 };
 
 /// HTTP GraphQL client for a running `Archive-Node-API` server.
@@ -146,7 +146,7 @@ impl AnaBlock {
       feeTransfer { recipient fee type } }";
 }
 
-/// Archive-Node-API history adapter. `provenance() == TrustedArchive` — it reads the same
+/// Archive-Node-API history adapter. `provenance() == Trusted` — it reads the same
 /// archive Postgres a [`crate::PostgresArchive`] would, just through the API's GraphQL.
 #[derive(Debug)]
 pub struct ArchiveNodeApiArchive {
@@ -263,8 +263,8 @@ impl ArchiveNodeApiArchive {
 
 #[async_trait]
 impl MinaArchive for ArchiveNodeApiArchive {
-  fn provenance(&self) -> Provenance {
-    Provenance::TrustedArchive
+  fn provenance(&self) -> ArchiveProvenance {
+    ArchiveProvenance::Trusted
   }
 
   async fn tip(&self) -> Result<ArchiveTip, MinaMeshError> {

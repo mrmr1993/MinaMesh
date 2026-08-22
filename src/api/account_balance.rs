@@ -2,7 +2,7 @@ use coinbase_mesh::models::{
   AccountBalanceRequest, AccountBalanceResponse, AccountIdentifier, Amount, BlockIdentifier,
 };
 
-use crate::{create_currency, MinaMesh, MinaMeshError, Provenance};
+use crate::{create_currency, MinaMesh, MinaMeshError, NodeProvenance};
 
 /// https://github.com/MinaProtocol/mina/blob/985eda49bdfabc046ef9001d3c406e688bc7ec45/src/app/rosetta/lib/account.ml#L11
 impl MinaMesh {
@@ -23,7 +23,7 @@ impl MinaMesh {
     // vesting split) or daemon (staged-tip balance with the liquid/locked split). The
     // provenance decides only the trustless metadata markers, so each path stays byte-identical.
     let acct = self.node.account(&public_key, None).await?.ok_or(MinaMeshError::AccountNotFound(public_key))?;
-    let verified = self.node.provenance() == Provenance::Verified;
+    let verified = self.node.provenance() == NodeProvenance::Verified;
     let metadata = if verified {
       serde_json::json!({
         "created_via_historical_lookup": false,

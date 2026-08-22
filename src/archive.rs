@@ -30,8 +30,7 @@ use crate::{
   generate_operations_user_command, generate_operations_zkapp_command, generate_transaction_metadata,
   util::{Wrapper, DEFAULT_TOKEN_ID},
   ChainStatus, HasTimestamp, IndexerClient, InternalCommand, InternalCommandMetadata, InternalCommandType, IxSearchTxn,
-  MinaMeshError, Payment, Provenance, TransactionStatus, UserCommand, UserCommandMetadata, UserCommandType,
-  ZkAppCommand,
+  MinaMeshError, Payment, TransactionStatus, UserCommand, UserCommandMetadata, UserCommandType, ZkAppCommand,
 };
 
 /// The Mina account-creation fee (nanomina) — a protocol constant (1 MINA) on these networks.
@@ -44,14 +43,29 @@ pub struct ArchiveTip {
   pub timestamp: i64,
 }
 
+/// How the caller knows a *history* response is true.
+///
+/// The live-node axis has its own type, [`crate::NodeProvenance`]. They are deliberately
+/// separate: an archive cannot be backed by a daemon and a node cannot be backed by an archive,
+/// so one enum spanning both would let either report a provenance it cannot have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveProvenance {
+  /// `mina-indexer`: a block is ingested only after its Pickles/kimchi proof verifies, so these
+  /// reads trust math rather than whoever served the block.
+  Verified,
+  /// A Mina archive Postgres you operate, directly or through Archive-Node-API — trusted
+  /// history, not proof-verified.
+  Trusted,
+}
+
 /// The single historical-read interface. The trustless indexer and a raw archive Postgres
 /// are interchangeable adapters behind it. Handlers compose these history reads with the
 /// live [`crate::MinaNode`] where an endpoint spans both axes (e.g. `/network/status`).
 #[async_trait]
 pub trait MinaArchive: Send + Sync {
   /// How the caller knows these history responses are true. `Verified` for the SNARK-gated
-  /// indexer, `TrustedArchive` for a Postgres archive you operate.
-  fn provenance(&self) -> Provenance;
+  /// indexer, `Trusted` for a Postgres archive you operate.
+  fn provenance(&self) -> ArchiveProvenance;
 
   /// The current canonical tip (height + state hash + timestamp millis).
   async fn tip(&self) -> Result<ArchiveTip, MinaMeshError>;
@@ -114,8 +128,8 @@ impl IndexerArchive {
 
 #[async_trait]
 impl MinaArchive for IndexerArchive {
-  fn provenance(&self) -> Provenance {
-    Provenance::Verified
+  fn provenance(&self) -> ArchiveProvenance {
+    ArchiveProvenance::Verified
   }
 
   async fn tip(&self) -> Result<ArchiveTip, MinaMeshError> {
@@ -602,8 +616,8 @@ impl PostgresArchive {
 
 #[async_trait]
 impl MinaArchive for PostgresArchive {
-  fn provenance(&self) -> Provenance {
-    Provenance::TrustedArchive
+  fn provenance(&self) -> ArchiveProvenance {
+    ArchiveProvenance::Trusted
   }
 
   async fn tip(&self) -> Result<ArchiveTip, MinaMeshError> {

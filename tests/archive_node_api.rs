@@ -15,7 +15,8 @@ use anyhow::Result;
 use axum::{routing::post, Json, Router};
 use coinbase_mesh::models::PartialBlockIdentifier;
 use mina_mesh::{
-  models::SearchTransactionsRequest, ArchiveNodeApiArchive, ArchiveNodeApiClient, MinaArchive, Payment, Provenance,
+  models::SearchTransactionsRequest, ArchiveNodeApiArchive, ArchiveNodeApiClient, ArchiveProvenance, MinaArchive,
+  Payment,
 };
 use pretty_assertions::assert_eq;
 use serde_json::{json, Value};
@@ -104,7 +105,7 @@ fn archive(client: ArchiveNodeApiClient) -> ArchiveNodeApiArchive {
 #[tokio::test]
 async fn provenance_is_trusted_archive() -> Result<()> {
   let a = archive(start_mock().await?);
-  assert_eq!(a.provenance(), Provenance::TrustedArchive);
+  assert_eq!(a.provenance(), ArchiveProvenance::Trusted);
   Ok(())
 }
 

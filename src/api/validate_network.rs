@@ -1,14 +1,14 @@
 use anyhow::Result;
 use coinbase_mesh::models::NetworkIdentifier;
 
-use crate::{CacheKey::NetworkId, MinaMesh, MinaMeshError, Provenance};
+use crate::{ArchiveProvenance, CacheKey::NetworkId, MinaMesh, MinaMeshError};
 
 impl MinaMesh {
   // Validate that the network identifier matches the network id of the GraphQL
   // server
   pub async fn validate_network(&self, network_identifier: &NetworkIdentifier) -> Result<(), MinaMeshError> {
     // Trustless mode (indexer history): validate against the configured network id — no daemon.
-    if self.archive.provenance() == Provenance::Verified {
+    if self.archive.provenance() == ArchiveProvenance::Verified {
       return self.compare_network_ids(&self.network_id, network_identifier);
     }
 

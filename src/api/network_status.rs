@@ -2,7 +2,7 @@
 
 use coinbase_mesh::models::{BlockIdentifier, NetworkRequest, NetworkStatusResponse, Peer, SyncStatus};
 
-use crate::{MinaMesh, MinaMeshError, Provenance};
+use crate::{ArchiveProvenance, MinaMesh, MinaMeshError};
 
 /// https://github.com/MinaProtocol/mina/blob/985eda49bdfabc046ef9001d3c406e688bc7ec45/src/app/rosetta/lib/network.ml#L201
 impl MinaMesh {
@@ -14,7 +14,7 @@ impl MinaMesh {
 
     // Trustless mode: current tip comes from the (indexer) history axis; the sync target is
     // the node's verified network tip (the light-node backend). No Mina daemon GraphQL.
-    if self.archive.provenance() == Provenance::Verified {
+    if self.archive.provenance() == ArchiveProvenance::Verified {
       let tip = self.archive.tip().await?;
       let current_index = tip.block_identifier.index;
       // Sync target = the node's proof-verified network tip. While the indexer backfills,

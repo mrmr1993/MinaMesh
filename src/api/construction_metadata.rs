@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 
 use crate::{
   create_currency, graphql::Block3, signer_utils::validate_base58_with_checksum, util::MINIMUM_USER_COMMAND_FEE,
-  DaemonBackend, MinaMesh, MinaMeshError, Provenance, TransactionMetadata,
+  ArchiveProvenance, DaemonBackend, MinaMesh, MinaMeshError, TransactionMetadata,
 };
 
 /// https://github.com/MinaProtocol/mina/blob/985eda49bdfabc046ef9001d3c406e688bc7ec45/src/app/rosetta/lib/construction.ml#L133
@@ -31,7 +31,7 @@ impl MinaMesh {
 
     // Trustless mode: current nonce + receiver existence from the (indexer) history axis; fees
     // from constants (no Mina daemon). The account-creation fee is the protocol constant 1 MINA.
-    if self.archive.provenance() == Provenance::Verified {
+    if self.archive.provenance() == ArchiveProvenance::Verified {
       const ACCOUNT_CREATION_FEE: u64 = 1_000_000_000;
       let inferred_nonce = self
         .archive

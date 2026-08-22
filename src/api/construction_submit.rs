@@ -2,7 +2,7 @@ use anyhow::Result;
 use coinbase_mesh::models::{ConstructionSubmitRequest, TransactionIdentifier, TransactionIdentifierResponse};
 use mina_p2p_messages::binprot::BinProtWrite;
 
-use crate::{MinaMesh, MinaMeshError, Payment, Provenance, SignedDelegation, SignedPayment, TransactionSigned};
+use crate::{MinaMesh, MinaMeshError, NodeProvenance, Payment, SignedDelegation, SignedPayment, TransactionSigned};
 
 /// https://github.com/MinaProtocol/mina/blob/985eda49bdfabc046ef9001d3c406e688bc7ec45/src/app/rosetta/lib/construction.ml#L849
 impl MinaMesh {
@@ -61,14 +61,14 @@ impl MinaMesh {
   /// maps the raw GraphQL error strings onto `TransactionSubmit*`; here we add the
   /// duplicate-vs-bad-nonce disambiguation that needs MinaMesh's cache and archive. Only the
   /// trusted daemon produces these structured submit errors — the light node's peer-to-peer
-  /// submit doesn't, so this is a no-op for `Provenance::Verified`.
+  /// submit doesn't, so this is a no-op for `NodeProvenance::Verified`.
   async fn enrich_submit_error(
     &self,
     err: MinaMeshError,
     signed_tx_str: &str,
     payment: Option<Payment>,
   ) -> MinaMeshError {
-    if self.node.provenance() != Provenance::TrustedDaemon {
+    if self.node.provenance() != NodeProvenance::Trusted {
       return err;
     }
     if let MinaMeshError::TransactionSubmitBadNonce(ref msg) = err {
