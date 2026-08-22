@@ -6,8 +6,8 @@ use crate::{MinaMesh, MinaMeshError};
 impl MinaMesh {
   pub async fn block(&self, request: BlockRequest) -> Result<BlockResponse, MinaMeshError> {
     self.validate_network(&request.network_identifier).await?;
-    // The block + its commands come from the history axis (trustless indexer or Postgres
-    // archive), assembled behind the `MinaArchive` trait.
-    self.archive.block(&request.block_identifier).await
+    // The history axis (trustless indexer, Postgres archive, ...) returns the block and the
+    // commands it carries; Rosetta assembly happens here, once, for every backend.
+    Ok(self.archive.block(&request.block_identifier).await?.into())
   }
 }

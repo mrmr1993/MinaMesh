@@ -106,7 +106,7 @@ pub enum AuthorizationKindType {
 }
 
 #[allow(dead_code)]
-#[derive(FromRow)]
+#[derive(Debug, FromRow)]
 pub struct ZkAppCommand {
   pub id: Option<i32>,
   pub memo: Option<String>,

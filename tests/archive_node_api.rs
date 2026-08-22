@@ -15,7 +15,8 @@ use anyhow::Result;
 use axum::{routing::post, Json, Router};
 use coinbase_mesh::models::PartialBlockIdentifier;
 use mina_mesh::{
-  models::SearchTransactionsRequest, ArchiveNodeApiArchive, ArchiveNodeApiClient, MinaArchive, Payment, Provenance,
+  models::{BlockResponse, SearchTransactionsRequest},
+  ArchiveNodeApiArchive, ArchiveNodeApiClient, MinaArchive, Payment, Provenance,
 };
 use pretty_assertions::assert_eq;
 use serde_json::{json, Value};
@@ -131,7 +132,9 @@ async fn oldest_block_identifier_is_genesis() -> Result<()> {
 #[tokio::test]
 async fn block_by_index_emits_user_commands_and_fee_transfer_but_not_coinbase() -> Result<()> {
   let a = archive(start_mock().await?);
-  let resp = a.block(&PartialBlockIdentifier { index: Some(TIP_HEIGHT), hash: None }).await?;
+  // The adapter returns the block and its commands; Rosetta assembly is shared, so exercise it
+  // here too rather than asserting on a shape no caller sees.
+  let resp: BlockResponse = a.block(&PartialBlockIdentifier { index: Some(TIP_HEIGHT), hash: None }).await?.into();
   let block = resp.block.expect("block present");
 
   assert_eq!(block.block_identifier.index, TIP_HEIGHT);

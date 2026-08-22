@@ -24,16 +24,15 @@
 
 use async_trait::async_trait;
 use coinbase_mesh::models::{
-  AccountBalanceResponse, Block, BlockIdentifier, BlockResponse, PartialBlockIdentifier, SearchTransactionsRequest,
-  SearchTransactionsResponse, Transaction, TransactionIdentifier,
+  AccountBalanceResponse, BlockIdentifier, PartialBlockIdentifier, SearchTransactionsRequest,
+  SearchTransactionsResponse,
 };
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::json;
 
 use crate::{
-  archive::internal_command_transaction, generate_operations_user_command, generate_transaction_metadata, ArchiveTip,
-  InternalCommandMetadata, InternalCommandType, MinaArchive, MinaMeshError, Payment, Provenance, TransactionStatus,
-  UserCommandMetadata, UserCommandType,
+  ArchiveBlock, ArchiveTip, InternalCommandMetadata, InternalCommandType, MinaArchive, MinaMeshError, Payment,
+  Provenance, TransactionStatus, UserCommandMetadata, UserCommandType,
 };
 
 /// HTTP GraphQL client for a running `Archive-Node-API` server.
@@ -177,7 +176,7 @@ impl ArchiveNodeApiArchive {
 
   /// Assemble a Rosetta block from an Archive-Node-API block. See the module docs for the
   /// coinbase / creation-fee / zkApp degradations.
-  fn to_block_response(block: AnaBlock) -> Result<BlockResponse, MinaMeshError> {
+  fn to_archive_block(block: AnaBlock) -> Result<ArchiveBlock, MinaMeshError> {
     let block_identifier = BlockIdentifier::new(block.block_height, block.state_hash.clone());
     // Blocks are height-contiguous; the parent is height-1 with the reported parent hash.
     // Genesis links to itself.
@@ -188,7 +187,8 @@ impl ArchiveNodeApiArchive {
     let timestamp = iso8601_to_millis(&block.date_time)
       .ok_or_else(|| MinaMeshError::Exception(format!("archive-node-api: unparseable dateTime {}", block.date_time)))?;
 
-    let mut transactions: Vec<Transaction> = Vec::new();
+    let mut user_commands: Vec<UserCommandMetadata> = Vec::new();
+    let mut internal_commands: Vec<InternalCommandMetadata> = Vec::new();
     let txns = block.transactions.unwrap_or(AnaTxns { user_commands: vec![], fee_transfer: vec![] });
 
     // User commands (payments / delegations). No account-creation-fee flag is exposed, so
@@ -219,12 +219,7 @@ impl ArchiveNodeApiArchive {
         failure_reason: uc.failure_reason,
         creation_fee: None,
       };
-      transactions.push(Transaction {
-        transaction_identifier: Box::new(TransactionIdentifier::new(uc.hash)),
-        operations: generate_operations_user_command(&meta),
-        metadata: generate_transaction_metadata(&meta),
-        related_transactions: None,
-      });
+      user_commands.push(meta);
     }
 
     // Fee transfers (all treated as plain, applied). Coinbase is intentionally skipped — the
@@ -245,18 +240,18 @@ impl ArchiveNodeApiArchive {
         status: TransactionStatus::Applied,
         coinbase_receiver: block.creator.clone(),
       };
-      transactions.push(internal_command_transaction(&meta));
+      internal_commands.push(meta);
     }
 
-    Ok(BlockResponse {
-      block: Some(Box::new(Block {
-        block_identifier: Box::new(block_identifier),
-        parent_block_identifier: Box::new(parent_block_identifier),
-        timestamp,
-        transactions,
-        metadata: block.creator.map(|c| json!({ "creator": c })),
-      })),
-      other_transactions: None,
+    Ok(ArchiveBlock {
+      block_identifier,
+      parent_block_identifier,
+      timestamp,
+      creator: block.creator,
+      user_commands,
+      internal_commands,
+      // The archive-node-api surface does not expose zkApp commands.
+      zkapp_commands: Vec::new(),
     })
   }
 }
@@ -279,7 +274,7 @@ impl MinaArchive for ArchiveNodeApiArchive {
     Ok(BlockIdentifier::new(b.block_height, b.state_hash))
   }
 
-  async fn block(&self, partial: &PartialBlockIdentifier) -> Result<BlockResponse, MinaMeshError> {
+  async fn block(&self, partial: &PartialBlockIdentifier) -> Result<ArchiveBlock, MinaMeshError> {
     let block = match (&partial.hash, partial.index) {
       // The API's `BlockQueryInput` has no `stateHash` filter, so hash lookups aren't possible.
       // Tracked upstream: o1-labs/Archive-Node-API#200.
@@ -292,7 +287,7 @@ impl MinaArchive for ArchiveNodeApiArchive {
       (None, None) => Some(self.extreme_block(true, AnaBlock::FULL_FIELDS).await?),
     }
     .ok_or_else(|| MinaMeshError::BlockMissing(partial.index, partial.hash.clone()))?;
-    Self::to_block_response(block)
+    Self::to_archive_block(block)
   }
 
   async fn historical_balance(

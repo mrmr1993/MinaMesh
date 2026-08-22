@@ -47,6 +47,51 @@ pub struct ArchiveTip {
 /// The single historical-read interface. The trustless indexer and a raw archive Postgres
 /// are interchangeable adapters behind it. Handlers compose these history reads with the
 /// live [`crate::MinaNode`] where an endpoint spans both axes (e.g. `/network/status`).
+/// A block as the history axis knows it: its identity, and the commands it carries in the
+/// backend-neutral shapes the operation generators already consume.
+///
+/// Adapters return this rather than a `BlockResponse` so that Rosetta assembly happens once,
+/// above the trait. An adapter answers only "what does this backend hold?"; how that is
+/// expressed as operations is not its business, and cannot drift between backends.
+#[derive(Debug)]
+pub struct ArchiveBlock {
+  pub block_identifier: BlockIdentifier,
+  pub parent_block_identifier: BlockIdentifier,
+  /// Block timestamp, unix millis.
+  pub timestamp: i64,
+  pub creator: Option<String>,
+  pub user_commands: Vec<UserCommandMetadata>,
+  pub internal_commands: Vec<InternalCommandMetadata>,
+  /// One entry per zkApp account update; see [`zkapp_commands_to_transactions`].
+  pub zkapp_commands: Vec<ZkAppCommand>,
+}
+
+impl From<ArchiveBlock> for BlockResponse {
+  fn from(block: ArchiveBlock) -> Self {
+    // Internal commands first, then user, then zkApp -- the order the Postgres adapter has
+    // always produced.
+    let mut transactions: Vec<Transaction> = block.internal_commands.iter().map(internal_command_transaction).collect();
+    transactions.extend(block.user_commands.iter().map(|meta| Transaction {
+      transaction_identifier: Box::new(TransactionIdentifier::new(meta.hash.clone())),
+      metadata: generate_transaction_metadata(meta),
+      operations: generate_operations_user_command(meta),
+      related_transactions: None,
+    }));
+    transactions.extend(zkapp_commands_to_transactions(block.zkapp_commands));
+
+    BlockResponse {
+      block: Some(Box::new(Block {
+        block_identifier: Box::new(block.block_identifier),
+        parent_block_identifier: Box::new(block.parent_block_identifier),
+        timestamp: block.timestamp,
+        transactions,
+        metadata: block.creator.map(|creator| json!({ "creator": creator })),
+      })),
+      other_transactions: None,
+    }
+  }
+}
+
 #[async_trait]
 pub trait MinaArchive: Send + Sync {
   /// How the caller knows these history responses are true. `Verified` for the SNARK-gated
@@ -59,8 +104,9 @@ pub trait MinaArchive: Send + Sync {
   /// The earliest canonical block held — the Rosetta `oldest_block` (archive availability floor).
   async fn oldest_block_identifier(&self) -> Result<BlockIdentifier, MinaMeshError>;
 
-  /// A fully-assembled Rosetta block (with its transactions) by height / state hash / best.
-  async fn block(&self, partial: &PartialBlockIdentifier) -> Result<BlockResponse, MinaMeshError>;
+  /// The block at the given height / state hash / best tip, with the commands it carries.
+  /// Rosetta assembly is done once by `BlockResponse::from`, not by each adapter.
+  async fn block(&self, partial: &PartialBlockIdentifier) -> Result<ArchiveBlock, MinaMeshError>;
 
   /// Historical balance + nonce for `public_key` at the block named by `partial`.
   async fn historical_balance(
@@ -136,7 +182,7 @@ impl MinaArchive for IndexerArchive {
   /// `InternalCommandMetadata` shapes. Degradations vs Postgres: internal-command transaction
   /// identifiers are synthesized from the block hash (the indexer doesn't expose internal-command
   /// hashes); zkApp commands are not itemized.
-  async fn block(&self, partial: &PartialBlockIdentifier) -> Result<BlockResponse, MinaMeshError> {
+  async fn block(&self, partial: &PartialBlockIdentifier) -> Result<ArchiveBlock, MinaMeshError> {
     let ix = self.resolve_block(partial).await?;
 
     let block_identifier = BlockIdentifier::new(ix.block_height as i64, ix.state_hash.clone());
@@ -148,7 +194,8 @@ impl MinaArchive for IndexerArchive {
     };
     let timestamp: i64 = ix.protocol_state.blockchain_state.utc_date.parse()?;
 
-    let mut transactions: Vec<Transaction> = Vec::new();
+    let mut user_commands: Vec<UserCommandMetadata> = Vec::new();
+    let mut internal_commands: Vec<InternalCommandMetadata> = Vec::new();
 
     // User commands (payments / delegations).
     for uc in &ix.transactions.user_commands {
@@ -175,12 +222,7 @@ impl MinaArchive for IndexerArchive {
         // Postgres `accounts_created` attribution; the generator negates it on the receiver).
         creation_fee: uc.receiver_account_creation_fee_paid.then(|| ACCOUNT_CREATION_FEE.to_string()),
       };
-      transactions.push(Transaction {
-        transaction_identifier: Box::new(TransactionIdentifier::new(meta.hash.clone())),
-        operations: generate_operations_user_command(&meta),
-        metadata: generate_transaction_metadata(&meta),
-        related_transactions: None,
-      });
+      user_commands.push(meta);
     }
 
     // Internal commands: coinbase + fee transfers + SNARK-work fees (all applied; nanomina).
@@ -221,7 +263,7 @@ impl MinaArchive for IndexerArchive {
             status: TransactionStatus::Applied,
             coinbase_receiver: Some(receiver.clone()),
           };
-          transactions.push(internal_command_transaction(&meta));
+          internal_commands.push(meta);
           seq += 1;
         }
       }
@@ -251,19 +293,19 @@ impl MinaArchive for IndexerArchive {
         status: TransactionStatus::Applied,
         coinbase_receiver: producer.clone(),
       };
-      transactions.push(internal_command_transaction(&meta));
+      internal_commands.push(meta);
       seq += 1;
     }
 
-    Ok(BlockResponse {
-      block: Some(Box::new(Block {
-        block_identifier: Box::new(block_identifier),
-        parent_block_identifier: Box::new(parent_block_identifier),
-        timestamp,
-        transactions,
-        metadata: Some(json!({ "creator": ix.creator_account.public_key })),
-      })),
-      other_transactions: None,
+    Ok(ArchiveBlock {
+      block_identifier,
+      parent_block_identifier,
+      timestamp,
+      creator: Some(ix.creator_account.public_key.clone()),
+      user_commands,
+      internal_commands,
+      // The indexer does not itemize zkApp commands on this branch.
+      zkapp_commands: Vec::new(),
     })
   }
 
@@ -401,51 +443,28 @@ impl PostgresArchive {
     Self { pool, search_tx_optimized }
   }
 
-  async fn user_commands(&self, metadata: &BlockMetadata) -> Result<Vec<Transaction>, MinaMeshError> {
-    let metadata = sqlx::query_file_as!(UserCommandMetadata, "sql/queries/user_commands.sql", metadata.id)
-      .fetch_all(&self.pool)
-      .await?;
-    let transactions = metadata
-      .into_iter()
-      .map(|item| Transaction {
-        transaction_identifier: Box::new(TransactionIdentifier::new(item.hash.clone())),
-        metadata: generate_transaction_metadata(&item),
-        operations: generate_operations_user_command(&item),
-        related_transactions: None,
-      })
-      .collect();
-    Ok(transactions)
+  async fn user_commands(&self, metadata: &BlockMetadata) -> Result<Vec<UserCommandMetadata>, MinaMeshError> {
+    Ok(
+      sqlx::query_file_as!(UserCommandMetadata, "sql/queries/user_commands.sql", metadata.id)
+        .fetch_all(&self.pool)
+        .await?,
+    )
   }
 
-  async fn internal_commands(&self, metadata: &BlockMetadata) -> Result<Vec<Transaction>, MinaMeshError> {
-    let metadata =
+  async fn internal_commands(&self, metadata: &BlockMetadata) -> Result<Vec<InternalCommandMetadata>, MinaMeshError> {
+    Ok(
       sqlx::query_file_as!(InternalCommandMetadata, "sql/queries/internal_commands.sql", metadata.id, DEFAULT_TOKEN_ID)
         .fetch_all(&self.pool)
-        .await?;
-    let transactions = metadata
-      .into_iter()
-      .map(|item| {
-        let transaction_identifier = generate_internal_command_transaction_identifier(
-          &item.command_type,
-          item.sequence_no,
-          item.secondary_sequence_no,
-          &item.hash,
-        );
-        Transaction::new(
-          TransactionIdentifier::new(transaction_identifier),
-          generate_operations_internal_command(&item),
-        )
-      })
-      .collect();
-    Ok(transactions)
+        .await?,
+    )
   }
 
-  async fn zkapp_commands(&self, metadata: &BlockMetadata) -> Result<Vec<Transaction>, MinaMeshError> {
-    let zkapp_commands =
+  async fn zkapp_commands(&self, metadata: &BlockMetadata) -> Result<Vec<ZkAppCommand>, MinaMeshError> {
+    Ok(
       sqlx::query_file_as!(ZkAppCommand, "sql/queries/zkapp_commands.sql", metadata.id, DEFAULT_TOKEN_ID)
         .fetch_all(&self.pool)
-        .await?;
-    Ok(zkapp_commands_to_transactions(zkapp_commands))
+        .await?,
+    )
   }
 
   async fn block_metadata(
@@ -622,7 +641,7 @@ impl MinaArchive for PostgresArchive {
     Ok(BlockIdentifier::new(oldest_block.height, oldest_block.state_hash))
   }
 
-  async fn block(&self, partial: &PartialBlockIdentifier) -> Result<BlockResponse, MinaMeshError> {
+  async fn block(&self, partial: &PartialBlockIdentifier) -> Result<ArchiveBlock, MinaMeshError> {
     let metadata = match self.block_metadata(partial).await? {
       Some(metadata) => metadata,
       None => return Err(MinaMeshError::BlockMissing(partial.index, partial.hash.clone())),
@@ -644,18 +663,14 @@ impl MinaArchive for PostgresArchive {
       self.zkapp_commands(&metadata)
     )?;
 
-    let all_commands: Vec<_> =
-      internal_commands.into_iter().chain(user_commands.into_iter()).chain(zkapp_commands.into_iter()).collect();
-
-    Ok(BlockResponse {
-      block: Some(Box::new(Block {
-        block_identifier: Box::new(block_identifier),
-        parent_block_identifier: Box::new(parent_block_identifier),
-        timestamp: metadata.timestamp.parse()?,
-        transactions: all_commands,
-        metadata: Some(json!({ "creator": metadata.creator })),
-      })),
-      other_transactions: None,
+    Ok(ArchiveBlock {
+      block_identifier,
+      parent_block_identifier,
+      timestamp: metadata.timestamp.parse()?,
+      creator: Some(metadata.creator),
+      user_commands,
+      internal_commands,
+      zkapp_commands,
     })
   }
 
