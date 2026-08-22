@@ -121,6 +121,36 @@ pub struct IxBlockTxns {
   pub fee_transfer: Vec<IxFeeTransfer>,
   #[serde(default)]
   pub user_commands: Vec<IxUserCommand>,
+  /// zkApp commands. The indexer serves these separately from `userCommands`, mirroring the
+  /// archive node's layout.
+  #[serde(default)]
+  pub zkapp_commands: Vec<IxZkAppCommand>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IxZkAppCommand {
+  pub hash: String,
+  pub fee_payer: String,
+  /// Fee in nanomina, as a string.
+  pub fee: String,
+  pub memo: String,
+  /// "applied" | "failed".
+  pub status: String,
+  pub failure_reason: Option<String>,
+  /// Per-account balance changes, in the order the ledger applies them, with updates nested
+  /// under `calls` flattened in. Without these the command's effect on balances is invisible.
+  #[serde(default)]
+  pub account_updates: Vec<IxZkAppAccountUpdate>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IxZkAppAccountUpdate {
+  pub public_key: String,
+  pub token: String,
+  /// Signed balance change in nanomina, as a string. Negative for a debit.
+  pub balance_change: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -280,6 +310,10 @@ impl IndexerClient {
           coinbase coinbaseReceiver coinbase_receiver_account_creation_fee_paid
           feeTransfer {{ fee recipient type }}
           userCommands {{ amount fee from to nonce memo hash kind failureReason isApplied receiver_account_creation_fee_paid }}
+          zkappCommands {{
+            hash feePayer fee memo status failureReason
+            accountUpdates {{ publicKey token balanceChange }}
+          }}
         }}
         snarkJobs {{ fee prover }}
       }} }}"#

@@ -29,9 +29,9 @@ use crate::{
   create_currency, generate_internal_command_transaction_identifier, generate_operations_internal_command,
   generate_operations_user_command, generate_operations_zkapp_command, generate_transaction_metadata,
   util::{Wrapper, DEFAULT_TOKEN_ID},
-  ChainStatus, HasTimestamp, IndexerClient, InternalCommand, InternalCommandMetadata, InternalCommandType, IxSearchTxn,
-  MinaMeshError, Payment, Provenance, TransactionStatus, UserCommand, UserCommandMetadata, UserCommandType,
-  ZkAppCommand,
+  ChainStatus, HasTimestamp, IndexerClient, InternalCommand, InternalCommandMetadata, InternalCommandType, IxBlock,
+  IxSearchTxn, IxZkAppAccountUpdate, MinaMeshError, Payment, Provenance, TransactionStatus, UserCommand,
+  UserCommandMetadata, UserCommandType, ZkAppCommand,
 };
 
 /// The Mina account-creation fee (nanomina) — a protocol constant (1 MINA) on these networks.
@@ -102,7 +102,7 @@ impl IndexerArchive {
   }
 
   /// Resolve the indexer block named by a partial identifier (hash wins, else height, else tip).
-  async fn resolve_block(&self, partial: &PartialBlockIdentifier) -> Result<crate::IxBlock, MinaMeshError> {
+  async fn resolve_block(&self, partial: &PartialBlockIdentifier) -> Result<IxBlock, MinaMeshError> {
     match (&partial.hash, partial.index) {
       (Some(h), _) => self.client.block(None, Some(h)).await?,
       (None, Some(idx)) => self.client.block(Some(idx), None).await?,
@@ -182,6 +182,8 @@ impl MinaArchive for IndexerArchive {
         related_transactions: None,
       });
     }
+
+    transactions.extend(zkapp_commands_to_transactions(indexer_zkapp_rows(&ix)));
 
     // Internal commands: coinbase + fee transfers + SNARK-work fees (all applied; nanomina).
     //
@@ -857,6 +859,53 @@ pub(crate) fn internal_command_transaction(meta: &InternalCommandMetadata) -> Tr
   Transaction::new(TransactionIdentifier::new(id), generate_operations_internal_command(meta))
 }
 
+/// Flatten an indexer block's zkApp commands into the row-per-account-update shape
+/// [`generate_operations_zkapp_command`] expects: it emits the fee operation once per
+/// transaction and one balance-update operation per row. A command with no account updates
+/// still yields a row, so its fee is reported.
+///
+/// The indexer does not expose per-account creation fees for zkApp commands, so `creation_fee`
+/// is left unset. When it gains that field this function must populate it, or an account created
+/// by a zkApp is over-credited by one creation fee relative to the Postgres backend.
+pub fn indexer_zkapp_rows(ix: &IxBlock) -> Vec<ZkAppCommand> {
+  let mut rows = Vec::new();
+  for zc in &ix.transactions.zkapp_commands {
+    let status =
+      if zc.status.eq_ignore_ascii_case("applied") { TransactionStatus::Applied } else { TransactionStatus::Failed };
+    let failure_reasons = zc.failure_reason.clone().map(|reason| vec![reason]);
+    let mut push = |update: Option<&IxZkAppAccountUpdate>| {
+      rows.push(ZkAppCommand {
+        id: None,
+        memo: Some(zc.memo.clone()),
+        hash: zc.hash.clone(),
+        fee_payer: zc.fee_payer.clone(),
+        pk_update_body: update.map(|u| u.public_key.clone()),
+        fee: zc.fee.clone(),
+        valid_until: None,
+        nonce: None,
+        sequence_no: 0,
+        status: status.clone(),
+        balance_change: update.map(|u| u.balance_change.clone()),
+        state_hash: Some(ix.state_hash.clone()),
+        failure_reasons: failure_reasons.clone(),
+        token: update.map(|u| u.token.clone()),
+        height: Some(ix.block_height as i64),
+        total_count: Some(0),
+        block_id: None,
+        timestamp: Some(ix.protocol_state.blockchain_state.utc_date.clone()),
+      })
+    };
+    if zc.account_updates.is_empty() {
+      push(None);
+    } else {
+      for update in &zc.account_updates {
+        push(Some(update));
+      }
+    }
+  }
+  rows
+}
+
 pub fn zkapp_commands_to_transactions(commands: Vec<ZkAppCommand>) -> Vec<Transaction> {
   let block_map = generate_operations_zkapp_command(commands);
 
@@ -1130,4 +1179,105 @@ fn build_block_identifier(
     hash: db_hash.clone().ok_or(MinaMeshError::BlockMissing(index, hash.clone()))?,
     index: db_height.ok_or(MinaMeshError::BlockMissing(index, hash))?,
   })
+}
+
+#[cfg(test)]
+mod tests {
+  use super::indexer_zkapp_rows;
+  use crate::{
+    IxBlock, IxBlockTxns, IxBlockchainState, IxPk, IxProtocolState, IxZkAppAccountUpdate, IxZkAppCommand,
+    TransactionStatus,
+  };
+
+  fn block(zkapp_commands: Vec<IxZkAppCommand>) -> IxBlock {
+    IxBlock {
+      state_hash: "3NLa".to_string(),
+      block_height: 42,
+      global_slot_since_genesis: 42,
+      canonical: true,
+      creator_account: IxPk { public_key: "B62qcreator".to_string() },
+      protocol_state: IxProtocolState {
+        previous_state_hash: "3NLprev".to_string(),
+        blockchain_state: IxBlockchainState { utc_date: "1700000000000".to_string() },
+      },
+      transactions: IxBlockTxns {
+        coinbase: "0".to_string(),
+        coinbase_receiver: None,
+        coinbase_receiver_account_creation_fee_paid: false,
+        fee_transfer: vec![],
+        user_commands: vec![],
+        zkapp_commands,
+      },
+      snark_jobs: vec![],
+    }
+  }
+
+  fn command(updates: Vec<IxZkAppAccountUpdate>, status: &str) -> IxZkAppCommand {
+    IxZkAppCommand {
+      hash: "5Jtx".to_string(),
+      fee_payer: "B62qfeepayer".to_string(),
+      fee: "100000000".to_string(),
+      memo: "memo".to_string(),
+      status: status.to_string(),
+      failure_reason: None,
+      account_updates: updates,
+    }
+  }
+
+  fn update(public_key: &str, balance_change: &str) -> IxZkAppAccountUpdate {
+    IxZkAppAccountUpdate {
+      public_key: public_key.to_string(),
+      token: crate::util::DEFAULT_TOKEN_ID.to_string(),
+      balance_change: balance_change.to_string(),
+    }
+  }
+
+  #[test]
+  fn a_block_with_no_zkapp_commands_yields_no_rows() {
+    assert!(indexer_zkapp_rows(&block(vec![])).is_empty());
+  }
+
+  // One row per account update, carrying that update's account, token and balance change --
+  // the shape generate_operations_zkapp_command consumes.
+  #[test]
+  fn one_row_per_account_update() {
+    let rows = indexer_zkapp_rows(&block(vec![command(
+      vec![update("B62qa", "-1000000000"), update("B62qb", "1000000000")],
+      "applied",
+    )]));
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].pk_update_body.as_deref(), Some("B62qa"));
+    assert_eq!(rows[0].balance_change.as_deref(), Some("-1000000000"));
+    assert_eq!(rows[1].pk_update_body.as_deref(), Some("B62qb"));
+    assert_eq!(rows[1].balance_change.as_deref(), Some("1000000000"));
+    // The fee and hash repeat on every row; the operation generator emits the fee once.
+    assert!(rows.iter().all(|r| r.fee == "100000000" && r.hash == "5Jtx"));
+  }
+
+  // A command with no updates must still produce a row, or its fee goes unreported.
+  #[test]
+  fn a_command_without_updates_still_reports_its_fee() {
+    let rows = indexer_zkapp_rows(&block(vec![command(vec![], "applied")]));
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].pk_update_body.is_none());
+    assert!(rows[0].balance_change.is_none());
+    assert_eq!(rows[0].fee, "100000000");
+  }
+
+  #[test]
+  fn failed_commands_are_marked_failed_and_carry_their_reason() {
+    let mut cmd = command(vec![update("B62qa", "-1")], "failed");
+    cmd.failure_reason = Some("Invalid_fee_excess".to_string());
+    let rows = indexer_zkapp_rows(&block(vec![cmd]));
+    assert_eq!(rows[0].status, TransactionStatus::Failed);
+    assert_eq!(rows[0].failure_reasons.as_deref(), Some(["Invalid_fee_excess".to_string()].as_slice()));
+  }
+
+  #[test]
+  fn rows_carry_the_block_identity_the_grouping_needs() {
+    let rows = indexer_zkapp_rows(&block(vec![command(vec![update("B62qa", "1")], "applied")]));
+    assert_eq!(rows[0].height, Some(42));
+    assert_eq!(rows[0].state_hash.as_deref(), Some("3NLa"));
+    assert_eq!(rows[0].timestamp.as_deref(), Some("1700000000000"));
+  }
 }
