@@ -24,6 +24,11 @@ Looking to get started? Check out the
 - Configuration details
 - Usage examples
 
+Before pointing Mina Mesh at an archive database, read
+**[Archive database requirements](docs/archive-database-requirements.md)** — the
+official archive dumps carry settings that make Mina Mesh fail under load with a
+misleading error unless PostgreSQL is configured for them.
+
 ---
 
 ## **Code of Conduct**
