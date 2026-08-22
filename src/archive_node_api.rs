@@ -372,7 +372,33 @@ fn iso8601_to_millis(s: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-  use super::iso8601_to_millis;
+  use super::{iso8601_to_millis, AnaBlock, AnaTxns, AnaUserCommand, ArchiveNodeApiArchive};
+
+  fn block(height: i64, parent_hash: Option<&str>, user_commands: Vec<AnaUserCommand>) -> AnaBlock {
+    AnaBlock {
+      block_height: height,
+      state_hash: format!("3NLblock{height}"),
+      parent_hash: parent_hash.map(str::to_string),
+      creator: Some("B62qcreator".to_string()),
+      date_time: "2024-01-02T03:04:05.678Z".to_string(),
+      transactions: Some(AnaTxns { user_commands, fee_transfer: vec![] }),
+    }
+  }
+
+  fn payment() -> AnaUserCommand {
+    AnaUserCommand {
+      hash: "5Jtx".to_string(),
+      kind: "PAYMENT".to_string(),
+      from: "B62qsender".to_string(),
+      to: "B62qreceiver".to_string(),
+      amount: "2000000000".to_string(),
+      fee: "100000000".to_string(),
+      memo: "memo".to_string(),
+      nonce: 7,
+      status: "applied".to_string(),
+      failure_reason: None,
+    }
+  }
 
   #[test]
   fn parses_iso_utc_millis() {
@@ -382,5 +408,49 @@ mod tests {
     assert_eq!(iso8601_to_millis("1970-01-01T00:00:00Z"), Some(0));
     assert_eq!(iso8601_to_millis("1970-01-01T00:00:01.000Z"), Some(1000));
     assert_eq!(iso8601_to_millis("not-a-date"), None);
+  }
+
+  #[test]
+  fn a_block_links_to_its_parent_at_height_minus_one() {
+    let response = ArchiveNodeApiArchive::to_block_response(block(100, Some("3NLparent"), vec![])).unwrap();
+    let block = response.block.unwrap();
+    assert_eq!(block.block_identifier.index, 100);
+    assert_eq!(block.parent_block_identifier.index, 99);
+    assert_eq!(block.parent_block_identifier.hash, "3NLparent");
+    assert_eq!(block.timestamp, 1_704_164_645_678);
+  }
+
+  // Genesis has no parent to point at, so Rosetta wants it to link to itself.
+  #[test]
+  fn genesis_links_to_itself() {
+    let response = ArchiveNodeApiArchive::to_block_response(block(1, Some("3NLwhatever"), vec![])).unwrap();
+    let block = response.block.unwrap();
+    assert_eq!(*block.parent_block_identifier, *block.block_identifier);
+  }
+
+  // A block whose parent hash is absent must not claim a parent at height-1 it cannot name.
+  #[test]
+  fn a_missing_parent_hash_links_to_itself() {
+    let response = ArchiveNodeApiArchive::to_block_response(block(100, None, vec![])).unwrap();
+    let block = response.block.unwrap();
+    assert_eq!(*block.parent_block_identifier, *block.block_identifier);
+  }
+
+  #[test]
+  fn user_commands_become_transactions_with_operations() {
+    let response = ArchiveNodeApiArchive::to_block_response(block(100, Some("3NLparent"), vec![payment()])).unwrap();
+    let block = response.block.unwrap();
+    assert_eq!(block.transactions.len(), 1);
+    let txn = &block.transactions[0];
+    assert_eq!(txn.transaction_identifier.hash, "5Jtx");
+    let types: Vec<_> = txn.operations.iter().map(|op| op.r#type.as_str()).collect();
+    assert_eq!(types, vec!["fee_payment", "payment_source_dec", "payment_receiver_inc"]);
+  }
+
+  #[test]
+  fn an_unparseable_timestamp_is_an_error_not_a_panic() {
+    let mut b = block(100, Some("3NLparent"), vec![]);
+    b.date_time = "not-a-date".to_string();
+    assert!(ArchiveNodeApiArchive::to_block_response(b).is_err());
   }
 }

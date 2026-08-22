@@ -494,3 +494,68 @@ impl DaemonBackend {
     self.client.send(query).await
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use super::{NodeUserCommand, Provenance};
+  use crate::{generate_operations_user_command, UserCommandType};
+
+  fn command(command_type: UserCommandType, amount: Option<u64>) -> NodeUserCommand {
+    NodeUserCommand {
+      command_type,
+      fee_payer: "B62qsender".to_string(),
+      source: "B62qsender".to_string(),
+      receiver: "B62qreceiver".to_string(),
+      nonce: 7,
+      fee: 100_000_000,
+      amount,
+      memo: Some("memo".to_string()),
+      hash: "5Jtx".to_string(),
+      token: None,
+    }
+  }
+
+  fn ops(command: &NodeUserCommand) -> Vec<(String, Option<String>, String)> {
+    generate_operations_user_command(command)
+      .into_iter()
+      .map(|op| (op.r#type, op.amount.map(|a| a.value), op.account.map(|a| a.address).unwrap_or_default()))
+      .collect()
+  }
+
+  // The point of NodeUserCommand is that a pending mempool transaction reuses the same
+  // operation generator as history, so the shapes cannot drift apart.
+  #[test]
+  fn a_pending_payment_produces_fee_and_transfer_operations() {
+    let ops = ops(&command(UserCommandType::Payment, Some(2_000_000_000)));
+    assert_eq!(
+      ops,
+      vec![
+        ("fee_payment".to_string(), Some("-100000000".to_string()), "B62qsender".to_string()),
+        ("payment_source_dec".to_string(), Some("-2000000000".to_string()), "B62qsender".to_string()),
+        ("payment_receiver_inc".to_string(), Some("2000000000".to_string()), "B62qreceiver".to_string()),
+      ]
+    );
+  }
+
+  #[test]
+  fn a_pending_delegation_moves_no_funds() {
+    let ops = ops(&command(UserCommandType::Delegation, None));
+    let types: Vec<_> = ops.iter().map(|(t, _, _)| t.as_str()).collect();
+    assert_eq!(types, vec!["fee_payment", "delegate_change"]);
+    assert!(ops.iter().all(|(t, amount, _)| t != "delegate_change" || amount.is_none()));
+  }
+
+  // A pending transaction has neither succeeded nor failed; it is reported as applied, so the
+  // operations carry a status rather than being emitted as unknown.
+  #[test]
+  fn pending_operations_are_reported_as_successful() {
+    let generated = generate_operations_user_command(&command(UserCommandType::Payment, Some(1)));
+    assert!(generated.iter().all(|op| op.status.as_deref() == Some("Success")));
+  }
+
+  #[test]
+  fn provenance_distinguishes_verified_from_trusted() {
+    assert_ne!(Provenance::Verified, Provenance::TrustedDaemon);
+    assert_ne!(Provenance::Verified, Provenance::TrustedArchive);
+  }
+}
