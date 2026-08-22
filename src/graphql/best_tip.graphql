@@ -1,0 +1,5 @@
+query QueryBestTip {
+  bestChain(maxLength: 1) {
+    stateHash
+  }
+}

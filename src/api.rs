@@ -1,4 +1,5 @@
 mod account_balance;
+mod best_tip;
 mod block;
 mod cache;
 mod call;

@@ -1,7 +1,8 @@
 -- As with maybe_account_balance_info.sql, the addressable blocks are the canonical chain plus the
 -- single pending branch descending from the best tip -- not every pending block at a given height.
 -- Resolving a bare height during a fork would otherwise return an arbitrary one of the competing
--- branches.
+-- branches. The branch is seeded from the tip the daemon reports as best ($3) when one is
+-- available, falling back to the (timestamp, state_hash) heuristic otherwise.
 WITH RECURSIVE
   pending_chain AS (
     (
@@ -15,11 +16,18 @@ WITH RECURSIVE
       FROM
         blocks
       WHERE
-        height=(
-          SELECT
-            max(height)
-          FROM
-            blocks
+        (
+          $3::text IS NOT NULL
+          AND state_hash=$3
+        )
+        OR (
+          $3::text IS NULL
+          AND height=(
+            SELECT
+              max(height)
+            FROM
+              blocks
+          )
         )
       ORDER BY
         TIMESTAMP ASC,

@@ -3,7 +3,10 @@
 -- admit every competing branch during a fork, and the LIMIT 1 below would then pick among them
 -- arbitrarily -- so a balance could be served from a branch about to be orphaned.
 --
--- This mirrors the OCaml implementation's `Balance_from_last_relevant_command.query_pending`.
+-- This mirrors the OCaml implementation's `Balance_from_last_relevant_command.query_pending`,
+-- except that the branch is seeded from the tip the daemon reports as best ($4) when one is
+-- available. Choosing it here by (timestamp, state_hash) is not Mina's consensus rule; the
+-- fallback below keeps that behaviour for when the daemon cannot be reached.
 WITH RECURSIVE
   pending_chain AS (
     (
@@ -16,11 +19,18 @@ WITH RECURSIVE
       FROM
         blocks
       WHERE
-        height=(
-          SELECT
-            max(height)
-          FROM
-            blocks
+        (
+          $4::text IS NOT NULL
+          AND state_hash=$4
+        )
+        OR (
+          $4::text IS NULL
+          AND height=(
+            SELECT
+              max(height)
+            FROM
+              blocks
+          )
         )
       ORDER BY
         TIMESTAMP ASC,

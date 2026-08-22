@@ -31,7 +31,8 @@ impl MinaMesh {
   ) -> Result<AccountBalanceResponse, MinaMeshError> {
     let index = partial_block_id.index;
     let hash = partial_block_id.hash;
-    let block = sqlx::query_file!("sql/queries/maybe_block.sql", index, hash)
+    let best_tip = self.best_tip_state_hash().await;
+    let block = sqlx::query_file!("sql/queries/maybe_block.sql", index, hash, best_tip)
       .fetch_optional(&self.pg_pool)
       .await?
       .ok_or(MinaMeshError::BlockMissing(index, hash.clone()))?;
@@ -39,7 +40,8 @@ impl MinaMesh {
       "sql/queries/maybe_account_balance_info.sql",
       public_key,
       block.height.ok_or(MinaMeshError::ChainInfoMissing)?,
-      Wrapper(metadata).token_id_or_default()?
+      Wrapper(metadata).token_id_or_default()?,
+      best_tip
     )
     .fetch_optional(&self.pg_pool)
     .await?;
