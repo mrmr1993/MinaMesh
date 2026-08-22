@@ -1,0 +1,11 @@
+DROP TRIGGER if EXISTS trigger_remove_from_user_commands_aggregated ON blocks_user_commands;
+
+DROP TRIGGER if EXISTS trigger_remove_from_internal_commands_aggregated ON blocks_internal_commands;
+
+DROP TRIGGER if EXISTS trigger_remove_from_zkapp_commands_aggregated ON blocks_zkapp_commands;
+
+DROP FUNCTION if EXISTS remove_from_user_commands_aggregated;
+
+DROP FUNCTION if EXISTS remove_from_internal_commands_aggregated;
+
+DROP FUNCTION if EXISTS remove_from_zkapp_commands_aggregated;

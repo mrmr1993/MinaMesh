@@ -6,7 +6,7 @@ DROP TRIGGER if EXISTS trigger_add_to_internal_commands_aggregated ON blocks_int
 DROP TRIGGER if EXISTS trigger_add_to_zkapp_commands_aggregated ON blocks_zkapp_commands;
 
 -- Drop the function
-DROP FUNCTION if EXISTS update_user_commands_aggregated;
+DROP FUNCTION if EXISTS add_to_user_commands_aggregated;
 
 DROP FUNCTION if EXISTS add_to_internal_commands_aggregated;
 
