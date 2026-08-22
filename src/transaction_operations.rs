@@ -333,12 +333,14 @@ pub fn generate_operations_zkapp_command(commands: Vec<ZkAppCommand>) -> BlockMa
     }
 
     if let Some(balance_change) = &command.balance_change {
+      let account = command.pk_update_body.clone().unwrap_or_default();
+      let balance_update_index = operations.len() as i64;
       // Add zkapp balance update operation
       operations.push(operation(
-        operations.len() as i64,
+        balance_update_index,
         Some(balance_change),
         &AccountIdentifier {
-          address: command.pk_update_body.unwrap_or_default().clone(),
+          address: account.clone(),
           metadata: Some(json!({ "token_id": command.token })),
           sub_account: None,
         },
@@ -348,8 +350,113 @@ pub fn generate_operations_zkapp_command(commands: Vec<ZkAppCommand>) -> BlockMa
         None,
         command.token.as_ref(),
       ));
+
+      // The balance change above is gross of the account creation fee the ledger charged this
+      // account for creating it, so without this the account is credited a whole fee too much.
+      // Always in MINA: the ledger rejects an implicit creation fee on any other token.
+      if let Some(creation_fee) = &command.creation_fee {
+        operations.push(operation(
+          operations.len() as i64,
+          Some(&format!("-{}", creation_fee)),
+          &AccountIdentifier {
+            address: account,
+            metadata: Some(json!({ "token_id": DEFAULT_TOKEN_ID })),
+            sub_account: None,
+          },
+          OperationType::AccountCreationFeeViaZkapp,
+          Some(&TransactionStatus::Applied),
+          Some(vec![balance_update_index]),
+          None,
+          None,
+        ));
+      }
     }
   }
 
   block_map
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{generate_operations_zkapp_command, DEFAULT_TOKEN_ID};
+  use crate::{TransactionStatus, ZkAppCommand};
+
+  fn update(balance_change: &str, creation_fee: Option<&str>) -> ZkAppCommand {
+    ZkAppCommand {
+      id: Some(1),
+      memo: None,
+      hash: "5Jtx".to_string(),
+      fee_payer: "B62qfeepayer".to_string(),
+      pk_update_body: Some("B62qcreated".to_string()),
+      fee: "100000000".to_string(),
+      valid_until: None,
+      nonce: Some(0),
+      sequence_no: 0,
+      status: TransactionStatus::Applied,
+      balance_change: Some(balance_change.to_string()),
+      creation_fee: creation_fee.map(str::to_string),
+      state_hash: Some("3NLa".to_string()),
+      failure_reasons: None,
+      token: Some(DEFAULT_TOKEN_ID.to_string()),
+      height: Some(1),
+      total_count: Some(0),
+      block_id: Some(1),
+      timestamp: Some("0".to_string()),
+    }
+  }
+
+  fn operations(commands: Vec<ZkAppCommand>) -> Vec<(String, Option<String>, String)> {
+    generate_operations_zkapp_command(commands)
+      .into_values()
+      .flat_map(|txs| txs.into_values())
+      .flatten()
+      .map(|op| {
+        let account = op.account.map(|a| a.address).unwrap_or_default();
+        (op.r#type, op.amount.map(|a| a.value), account)
+      })
+      .collect()
+  }
+
+  #[test]
+  fn no_creation_fee_leaves_the_balance_change_alone() {
+    let ops = operations(vec![update("1800000000", None)]);
+    assert_eq!(
+      ops,
+      vec![
+        ("zkapp_fee_payer_dec".to_string(), Some("-100000000".to_string()), "B62qfeepayer".to_string()),
+        ("zkapp_balance_update".to_string(), Some("1800000000".to_string()), "B62qcreated".to_string()),
+      ]
+    );
+  }
+
+  // The recorded balance change is gross of the fee, so the pair must net to what the ledger
+  // actually credited the account -- 1.8 MINA in, 1 MINA fee, 0.8 MINA kept.
+  #[test]
+  fn creation_fee_is_charged_to_the_created_account() {
+    let ops = operations(vec![update("1800000000", Some("1000000000"))]);
+    assert_eq!(
+      ops,
+      vec![
+        ("zkapp_fee_payer_dec".to_string(), Some("-100000000".to_string()), "B62qfeepayer".to_string()),
+        ("zkapp_balance_update".to_string(), Some("1800000000".to_string()), "B62qcreated".to_string()),
+        ("account_creation_fee_via_zkapp".to_string(), Some("-1000000000".to_string()), "B62qcreated".to_string()),
+      ]
+    );
+    let net: i64 = ops
+      .iter()
+      .filter(|(_, _, a)| a == "B62qcreated")
+      .filter_map(|(_, v, _)| v.as_ref())
+      .map(|v| v.parse::<i64>().unwrap())
+      .sum();
+    assert_eq!(net, 800000000);
+  }
+
+  // Only the update that created the account carries a fee; a second update on the same account
+  // in the same command must not be charged again.
+  #[test]
+  fn only_the_creating_update_carries_the_fee() {
+    let ops = operations(vec![update("1800000000", Some("1000000000")), update("0", None)]);
+    let fees = ops.iter().filter(|(t, _, _)| t == "account_creation_fee_via_zkapp").count();
+    assert_eq!(fees, 1);
+  }
 }

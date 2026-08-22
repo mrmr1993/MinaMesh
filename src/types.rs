@@ -80,6 +80,7 @@ pub enum OperationType {
   DelegateChange,
   ZkappFeePayerDec,
   ZkappBalanceUpdate,
+  AccountCreationFeeViaZkapp,
 }
 
 pub fn operation_types() -> Vec<String> {
@@ -119,6 +120,9 @@ pub struct ZkAppCommand {
   pub sequence_no: i32,
   pub status: TransactionStatus,
   pub balance_change: Option<String>,
+  /// The account creation fee charged to this update's own account, present only when the
+  /// update carries `implicit_account_creation_fee` and created the account.
+  pub creation_fee: Option<String>,
   pub state_hash: Option<String>,
   pub failure_reasons: Option<Vec<String>>,
   pub token: Option<String>,

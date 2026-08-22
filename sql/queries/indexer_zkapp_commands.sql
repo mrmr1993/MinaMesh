@@ -35,6 +35,7 @@ WITH
       bzc.sequence_no,
       bzc.status AS "status: TransactionStatus",
       zaub.balance_change,
+      ac.creation_fee,
       bzc.block_id,
       b.state_hash,
       b.height,
@@ -63,6 +64,41 @@ WITH
       INNER JOIN account_identifiers AS ai_update_body ON zaub.account_identifier_id=ai_update_body.id
       INNER JOIN public_keys AS pk_update_body ON ai_update_body.public_key_id=pk_update_body.id
       INNER JOIN tokens AS token_update_body ON ai_update_body.token_id=token_update_body.id
+      /* The account creation fee charged to an account this update created.
+
+         Mina charges it to the created account itself only when the update carries
+         implicit_account_creation_fee, by subtracting it from that update's own balance_change --
+         so the archive's recorded change is gross of the fee and an operation is needed to bring the
+         account back to what the ledger actually credited. Without the flag the fee comes out of the
+         command's excess instead, funded by the command's own negative balance changes, which are
+         already emitted as zkapp_balance_update operations.
+
+         The ledger rejects an implicit fee on a non-default token (Cannot_pay_creation_fee_in_token),
+         so for an applied command such an update is always a MINA update and survives this query's
+         token filter.
+
+         A created account is billed once per block, so where several applied updates in the block
+         could claim it -- including repeats of the same update -- only the earliest position does. */
+      LEFT JOIN accounts_created AS ac ON ac.block_id=bzc.block_id
+      AND ac.account_identifier_id=zaub.account_identifier_id
+      AND bzc.status='applied'
+      AND zaub.implicit_account_creation_fee
+      AND NOT EXISTS (
+        SELECT
+          1
+        FROM
+          blocks_zkapp_commands AS bzc2
+          INNER JOIN zkapp_commands AS zc2 ON zc2.id=bzc2.zkapp_command_id
+          CROSS JOIN LATERAL unnest(zc2.zkapp_account_updates_ids) WITH ORDINALITY AS au_ref2 (au_id, au_ord)
+          INNER JOIN zkapp_account_update AS zau2 ON zau2.id=au_ref2.au_id
+          INNER JOIN zkapp_account_update_body AS zaub2 ON zaub2.id=zau2.body_id
+        WHERE
+          bzc2.block_id=bzc.block_id
+          AND bzc2.status='applied'
+          AND zaub2.implicit_account_creation_fee
+          AND zaub2.account_identifier_id=zaub.account_identifier_id
+          AND (bzc2.sequence_no, zc2.id, au_ref2.au_ord)<(bzc.sequence_no, zc.id, au_ref.au_ord)
+      )
     WHERE
       (
         $1>=b.height
