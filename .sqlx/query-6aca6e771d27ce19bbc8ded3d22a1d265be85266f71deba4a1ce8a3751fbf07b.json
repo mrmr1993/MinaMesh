@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "-- Which of the daemon's candidate tips the archive actually holds. Ordered by the caller's\n-- preference, which is tip-first, so the first row is the best usable seed.\nSELECT\n  t.state_hash\nFROM\n  unnest($1::text[]) WITH ORDINALITY AS t (state_hash, ord)\n  INNER JOIN blocks b ON b.state_hash=t.state_hash\nORDER BY\n  t.ord ASC\nLIMIT\n  1\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "state_hash",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "6aca6e771d27ce19bbc8ded3d22a1d265be85266f71deba4a1ce8a3751fbf07b"
+}

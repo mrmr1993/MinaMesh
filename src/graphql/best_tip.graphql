@@ -1,5 +1,5 @@
-query QueryBestTip {
-  bestChain(maxLength: 1) {
+query QueryBestTip($maxLength: Int) {
+  bestChain(maxLength: $maxLength) {
     stateHash
   }
 }
