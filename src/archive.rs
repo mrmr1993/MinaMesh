@@ -92,6 +92,44 @@ impl From<ArchiveBlock> for BlockResponse {
   }
 }
 
+/// An account's balance at a historical block, as the history axis knows it. Adapters report
+/// the numbers; how they are expressed as a Rosetta `AccountBalanceResponse` is decided once,
+/// above the trait.
+#[derive(Debug, Clone)]
+pub struct ArchiveAccountBalance {
+  pub block_identifier: BlockIdentifier,
+  /// The token the balance is denominated in, or `None` when the account was not found at that
+  /// block -- the response then reports a default-token zero balance.
+  pub token_id: Option<String>,
+  pub total_balance: u64,
+  pub liquid_balance: u64,
+  pub locked_balance: u64,
+  pub nonce: u64,
+}
+
+impl From<ArchiveAccountBalance> for AccountBalanceResponse {
+  fn from(balance: ArchiveAccountBalance) -> Self {
+    AccountBalanceResponse {
+      block_identifier: Box::new(balance.block_identifier),
+      balances: vec![Amount {
+        currency: Box::new(create_currency(balance.token_id.as_ref())),
+        // Rosetta's `value` is the spendable balance; the locked/liquid/total split rides in
+        // metadata, as it has since the OCaml implementation.
+        value: balance.liquid_balance.to_string(),
+        metadata: Some(json!({
+          "locked_balance": balance.locked_balance,
+          "liquid_balance": balance.liquid_balance,
+          "total_balance": balance.total_balance
+        })),
+      }],
+      metadata: Some(json!({
+        "created_via_historical_lookup": true,
+        "nonce": balance.nonce.to_string()
+      })),
+    }
+  }
+}
+
 #[async_trait]
 pub trait MinaArchive: Send + Sync {
   /// How the caller knows these history responses are true. `Verified` for the SNARK-gated
@@ -108,13 +146,14 @@ pub trait MinaArchive: Send + Sync {
   /// Rosetta assembly is done once by `BlockResponse::from`, not by each adapter.
   async fn block(&self, partial: &PartialBlockIdentifier) -> Result<ArchiveBlock, MinaMeshError>;
 
-  /// Historical balance + nonce for `public_key` at the block named by `partial`.
+  /// Historical balance + nonce for `public_key` at the block named by `partial`. Rosetta
+  /// assembly is done once by `AccountBalanceResponse::from`, not by each adapter.
   async fn historical_balance(
     &self,
     public_key: &str,
     metadata: Option<Value>,
     partial: &PartialBlockIdentifier,
-  ) -> Result<AccountBalanceResponse, MinaMeshError>;
+  ) -> Result<ArchiveAccountBalance, MinaMeshError>;
 
   /// Search historical transactions.
   async fn search_transactions(
@@ -317,35 +356,26 @@ impl MinaArchive for IndexerArchive {
     public_key: &str,
     metadata: Option<Value>,
     partial: &PartialBlockIdentifier,
-  ) -> Result<AccountBalanceResponse, MinaMeshError> {
+  ) -> Result<ArchiveAccountBalance, MinaMeshError> {
     let token_id = Wrapper(metadata).token_id_or_default()?;
     let block = self.resolve_block(partial).await?;
     let block_identifier = BlockIdentifier { hash: block.state_hash.clone(), index: block.block_height as i64 };
     match self.client.staged_account(public_key, block.block_height, None).await? {
-      Some(acct) => Ok(AccountBalanceResponse {
-        block_identifier: Box::new(block_identifier),
-        balances: vec![Amount {
-          currency: Box::new(create_currency(Some(&token_id))),
-          value: acct.balance_nano.to_string(),
-          metadata: Some(json!({
-            "locked_balance": 0,
-            "liquid_balance": acct.balance_nano,
-            "total_balance": acct.balance_nano
-          })),
-        }],
-        metadata: Some(json!({
-          "created_via_historical_lookup": true,
-          "nonce": acct.nonce.to_string()
-        })),
+      Some(acct) => Ok(ArchiveAccountBalance {
+        block_identifier,
+        token_id: Some(token_id),
+        total_balance: acct.balance_nano,
+        liquid_balance: acct.balance_nano,
+        locked_balance: 0,
+        nonce: acct.nonce as u64,
       }),
-      None => Ok(AccountBalanceResponse {
-        block_identifier: Box::new(block_identifier),
-        balances: vec![Amount {
-          currency: Box::new(create_currency(None)),
-          value: "0".to_string(),
-          metadata: Some(json!({ "locked_balance": 0, "liquid_balance": 0, "total_balance": 0 })),
-        }],
-        metadata: Some(json!({ "created_via_historical_lookup": true, "nonce": "0" })),
+      None => Ok(ArchiveAccountBalance {
+        block_identifier,
+        token_id: None,
+        total_balance: 0,
+        liquid_balance: 0,
+        locked_balance: 0,
+        nonce: 0,
       }),
     }
   }
@@ -679,7 +709,7 @@ impl MinaArchive for PostgresArchive {
     public_key: &str,
     metadata: Option<Value>,
     partial: &PartialBlockIdentifier,
-  ) -> Result<AccountBalanceResponse, MinaMeshError> {
+  ) -> Result<ArchiveAccountBalance, MinaMeshError> {
     let index = partial.index;
     let hash = partial.hash.clone();
     let block = sqlx::query_file!("sql/queries/maybe_block.sql", index, hash)
@@ -695,14 +725,13 @@ impl MinaArchive for PostgresArchive {
     .fetch_optional(&self.pool)
     .await?;
     match maybe_account_balance_info {
-      None => Ok(AccountBalanceResponse {
-        block_identifier: Box::new(build_block_identifier(block.height, block.state_hash, index, hash)?),
-        balances: vec![Amount {
-          currency: Box::new(create_currency(None)),
-          value: "0".to_string(),
-          metadata: Some(json!({ "locked_balance": 0, "liquid_balance": 0, "total_balance": 0 })),
-        }],
-        metadata: Some(json!({ "created_via_historical_lookup": true, "nonce": "0" })),
+      None => Ok(ArchiveAccountBalance {
+        block_identifier: build_block_identifier(block.height, block.state_hash, index, hash)?,
+        token_id: None,
+        total_balance: 0,
+        liquid_balance: 0,
+        locked_balance: 0,
+        nonce: 0,
       }),
       Some(account_balance_info) => {
         let token_id = account_balance_info.token_id;
@@ -728,18 +757,13 @@ impl MinaArchive for PostgresArchive {
         };
         let total_balance = last_relevant_command_balance;
         let locked_balance = total_balance - liquid_balance;
-        Ok(AccountBalanceResponse {
-          block_identifier: Box::new(build_block_identifier(block.height, block.state_hash, index, hash)?),
-          balances: vec![Amount {
-            currency: Box::new(create_currency(Some(&token_id))),
-            value: liquid_balance.to_string(),
-            metadata: Some(json!({
-              "locked_balance": locked_balance,
-              "liquid_balance": liquid_balance,
-              "total_balance": total_balance
-            })),
-          }],
-          metadata: Some(json!({ "created_via_historical_lookup": true, "nonce": format!("{}", nonce) })),
+        Ok(ArchiveAccountBalance {
+          block_identifier: build_block_identifier(block.height, block.state_hash, index, hash)?,
+          token_id: Some(token_id),
+          total_balance,
+          liquid_balance,
+          locked_balance,
+          nonce: nonce as u64,
         })
       }
     }
@@ -1145,4 +1169,62 @@ fn build_block_identifier(
     hash: db_hash.clone().ok_or(MinaMeshError::BlockMissing(index, hash.clone()))?,
     index: db_height.ok_or(MinaMeshError::BlockMissing(index, hash))?,
   })
+}
+
+#[cfg(test)]
+mod balance_assembly_tests {
+  use coinbase_mesh::models::{AccountBalanceResponse, BlockIdentifier};
+
+  use super::ArchiveAccountBalance;
+  use crate::util::DEFAULT_TOKEN_ID;
+
+  fn balance(token_id: Option<&str>, total: u64, liquid: u64, locked: u64) -> ArchiveAccountBalance {
+    ArchiveAccountBalance {
+      block_identifier: BlockIdentifier::new(42, "3NLa".to_string()),
+      token_id: token_id.map(str::to_string),
+      total_balance: total,
+      liquid_balance: liquid,
+      locked_balance: locked,
+      nonce: 7,
+    }
+  }
+
+  // Rosetta's `value` is the spendable balance; the split rides in metadata.
+  #[test]
+  fn value_is_the_liquid_balance_and_the_split_is_metadata() {
+    let response: AccountBalanceResponse = balance(Some(DEFAULT_TOKEN_ID), 1000, 600, 400).into();
+    let amount = &response.balances[0];
+    assert_eq!(amount.value, "600");
+    let metadata = amount.metadata.as_ref().unwrap();
+    assert_eq!(metadata["total_balance"], 1000);
+    assert_eq!(metadata["liquid_balance"], 600);
+    assert_eq!(metadata["locked_balance"], 400);
+  }
+
+  #[test]
+  fn the_nonce_and_block_are_carried_through() {
+    let response: AccountBalanceResponse = balance(Some(DEFAULT_TOKEN_ID), 1, 1, 0).into();
+    assert_eq!(response.block_identifier.index, 42);
+    assert_eq!(response.block_identifier.hash, "3NLa");
+    let metadata = response.metadata.as_ref().unwrap();
+    assert_eq!(metadata["nonce"], "7");
+    assert_eq!(metadata["created_via_historical_lookup"], true);
+  }
+
+  // An account absent at that block reports a default-token zero rather than naming a token it
+  // was never found holding.
+  #[test]
+  fn an_absent_account_reports_a_default_token_zero() {
+    let response: AccountBalanceResponse = balance(None, 0, 0, 0).into();
+    let amount = &response.balances[0];
+    assert_eq!(amount.value, "0");
+    assert_eq!(amount.currency.symbol, "MINA");
+  }
+
+  #[test]
+  fn a_custom_token_is_named_in_the_currency() {
+    let response: AccountBalanceResponse =
+      balance(Some("wTYTc38ab19XT4oPPv7pajgGEUWWXc5AzDKvqqCNiFBfLCCnXK"), 5, 5, 0).into();
+    assert_ne!(response.balances[0].currency.symbol, "MINA");
+  }
 }

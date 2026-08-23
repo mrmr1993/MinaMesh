@@ -24,15 +24,14 @@
 
 use async_trait::async_trait;
 use coinbase_mesh::models::{
-  AccountBalanceResponse, BlockIdentifier, PartialBlockIdentifier, SearchTransactionsRequest,
-  SearchTransactionsResponse,
+  BlockIdentifier, PartialBlockIdentifier, SearchTransactionsRequest, SearchTransactionsResponse,
 };
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::json;
 
 use crate::{
-  ArchiveBlock, ArchiveTip, InternalCommandMetadata, InternalCommandType, MinaArchive, MinaMeshError, Payment,
-  Provenance, TransactionStatus, UserCommandMetadata, UserCommandType,
+  ArchiveAccountBalance, ArchiveBlock, ArchiveTip, InternalCommandMetadata, InternalCommandType, MinaArchive,
+  MinaMeshError, Payment, Provenance, TransactionStatus, UserCommandMetadata, UserCommandType,
 };
 
 /// HTTP GraphQL client for a running `Archive-Node-API` server.
@@ -295,7 +294,7 @@ impl MinaArchive for ArchiveNodeApiArchive {
     _public_key: &str,
     _metadata: Option<serde_json::Value>,
     _partial: &PartialBlockIdentifier,
-  ) -> Result<AccountBalanceResponse, MinaMeshError> {
+  ) -> Result<ArchiveAccountBalance, MinaMeshError> {
     // Needs a historical ledger-account query — tracked upstream: o1-labs/Archive-Node-API#200.
     Err(MinaMeshError::Exception(
       "archive-node-api backend does not expose ledger account state; historical balance is unsupported".to_string(),

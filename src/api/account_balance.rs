@@ -12,7 +12,9 @@ impl MinaMesh {
     match req.block_identifier {
       // Historical balance is a history-axis read (indexer staged ledger, or the Postgres
       // archive with vesting `timing_info`), assembled behind the `MinaArchive` trait.
-      Some(block_identifier) => self.archive.historical_balance(&address, metadata, &block_identifier).await,
+      Some(block_identifier) => {
+        Ok(self.archive.historical_balance(&address, metadata, &block_identifier).await?.into())
+      }
       None => self.frontier_balance(address).await,
     }
   }
