@@ -11,6 +11,7 @@ impl MinaMesh {
     // Transaction search is a history-axis read. The Postgres archive pages over user +
     // internal + zkApp commands with real offsets/total_count; the trustless indexer emulates
     // search over user commands only (no offset pagination). Both live behind `MinaArchive`.
-    self.archive.search_transactions(&req).await
+    let include_timestamp = req.include_timestamp.unwrap_or(false);
+    Ok(self.archive.search_transactions(&req).await?.into_response(include_timestamp))
   }
 }

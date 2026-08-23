@@ -23,15 +23,14 @@
 //!   * zkApp commands are not itemized (same as the indexer path).
 
 use async_trait::async_trait;
-use coinbase_mesh::models::{
-  BlockIdentifier, PartialBlockIdentifier, SearchTransactionsRequest, SearchTransactionsResponse,
-};
+use coinbase_mesh::models::{BlockIdentifier, PartialBlockIdentifier, SearchTransactionsRequest};
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::json;
 
 use crate::{
-  ArchiveAccountBalance, ArchiveBlock, ArchiveTip, InternalCommandMetadata, InternalCommandType, MinaArchive,
-  MinaMeshError, Payment, Provenance, TransactionStatus, UserCommandMetadata, UserCommandType,
+  ArchiveAccountBalance, ArchiveBlock, ArchiveTip, ArchiveTransactionPage, InternalCommandMetadata,
+  InternalCommandType, MinaArchive, MinaMeshError, Payment, Provenance, TransactionStatus, UserCommandMetadata,
+  UserCommandType,
 };
 
 /// HTTP GraphQL client for a running `Archive-Node-API` server.
@@ -304,7 +303,7 @@ impl MinaArchive for ArchiveNodeApiArchive {
   async fn search_transactions(
     &self,
     _req: &SearchTransactionsRequest,
-  ) -> Result<SearchTransactionsResponse, MinaMeshError> {
+  ) -> Result<ArchiveTransactionPage, MinaMeshError> {
     // Needs an account-scoped transaction query — tracked upstream: o1-labs/Archive-Node-API#200.
     Err(MinaMeshError::Exception(
       "archive-node-api backend does not support account-scoped transaction search".to_string(),

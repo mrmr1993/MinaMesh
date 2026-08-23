@@ -29,7 +29,7 @@ use crate::{
   create_currency, generate_internal_command_transaction_identifier, generate_operations_internal_command,
   generate_operations_user_command, generate_operations_zkapp_command, generate_transaction_metadata,
   util::{Wrapper, DEFAULT_TOKEN_ID},
-  ChainStatus, HasTimestamp, IndexerClient, InternalCommand, InternalCommandMetadata, InternalCommandType, IxSearchTxn,
+  ChainStatus, IndexerClient, InternalCommand, InternalCommandMetadata, InternalCommandType, IxSearchTxn,
   MinaMeshError, Payment, Provenance, TransactionStatus, UserCommand, UserCommandMetadata, UserCommandType,
   ZkAppCommand,
 };
@@ -130,6 +130,67 @@ impl From<ArchiveAccountBalance> for AccountBalanceResponse {
   }
 }
 
+/// One search hit: the command, and which block it was found in.
+#[derive(Debug)]
+pub struct ArchiveSearchCommand {
+  pub block_identifier: BlockIdentifier,
+  /// Block timestamp in unix millis, when the backend can supply one.
+  pub timestamp: Option<i64>,
+  pub command: ArchiveSearchCommandKind,
+}
+
+#[derive(Debug)]
+pub enum ArchiveSearchCommandKind {
+  User(UserCommandMetadata),
+  Internal(InternalCommandMetadata),
+}
+
+/// A page of search results, as the history axis knows it. Adapters own searching, filtering
+/// and pagination -- those are genuinely backend-specific -- but not how a hit is expressed as
+/// a Rosetta `BlockTransaction`, which is decided once by [`ArchiveTransactionPage::into_response`].
+#[derive(Debug)]
+pub struct ArchiveTransactionPage {
+  pub commands: Vec<ArchiveSearchCommand>,
+  /// zkApp hits arrive as one row per account update and are grouped during assembly.
+  pub zkapp_commands: Vec<ZkAppCommand>,
+  pub total_count: i64,
+  pub next_offset: Option<i64>,
+}
+
+impl From<ArchiveSearchCommand> for BlockTransaction {
+  fn from(hit: ArchiveSearchCommand) -> Self {
+    let transaction = match &hit.command {
+      ArchiveSearchCommandKind::User(meta) => Transaction {
+        transaction_identifier: Box::new(TransactionIdentifier::new(meta.hash.clone())),
+        operations: generate_operations_user_command(meta),
+        metadata: generate_transaction_metadata(meta),
+        related_transactions: None,
+      },
+      ArchiveSearchCommandKind::Internal(meta) => internal_command_transaction(meta),
+    };
+    BlockTransaction::new(hit.block_identifier, transaction)
+  }
+}
+
+impl ArchiveTransactionPage {
+  /// Assemble the page. `include_timestamp` is a property of the request, not of the backend,
+  /// so it is applied here rather than threaded into every adapter.
+  pub fn into_response(self, include_timestamp: bool) -> SearchTransactionsResponse {
+    let mut transactions: Vec<BlockTransaction> = self
+      .commands
+      .into_iter()
+      .map(|hit| {
+        let timestamp = hit.timestamp;
+        let mut bt: BlockTransaction = hit.into();
+        bt.timestamp = if include_timestamp { timestamp } else { None };
+        bt
+      })
+      .collect();
+    transactions.extend(zkapp_commands_to_block_transactions(self.zkapp_commands, include_timestamp));
+    SearchTransactionsResponse { transactions, total_count: self.total_count, next_offset: self.next_offset }
+  }
+}
+
 #[async_trait]
 pub trait MinaArchive: Send + Sync {
   /// How the caller knows these history responses are true. `Verified` for the SNARK-gated
@@ -155,11 +216,10 @@ pub trait MinaArchive: Send + Sync {
     partial: &PartialBlockIdentifier,
   ) -> Result<ArchiveAccountBalance, MinaMeshError>;
 
-  /// Search historical transactions.
-  async fn search_transactions(
-    &self,
-    req: &SearchTransactionsRequest,
-  ) -> Result<SearchTransactionsResponse, MinaMeshError>;
+  /// Search historical transactions. Rosetta assembly, and the request's `include_timestamp`,
+  /// are applied once by [`ArchiveTransactionPage::into_response`].
+  async fn search_transactions(&self, req: &SearchTransactionsRequest)
+    -> Result<ArchiveTransactionPage, MinaMeshError>;
 
   /// The best (latest) account nonce, or `None` if the account doesn't exist yet
   /// (`construction/metadata`: current nonce + receiver existence ⇒ creation fee).
@@ -388,9 +448,8 @@ impl MinaArchive for IndexerArchive {
   async fn search_transactions(
     &self,
     req: &SearchTransactionsRequest,
-  ) -> Result<SearchTransactionsResponse, MinaMeshError> {
+  ) -> Result<ArchiveTransactionPage, MinaMeshError> {
     let qp = SearchTransactionsQueryParams::try_from(req.clone())?;
-    let include_timestamp = req.include_timestamp.unwrap_or(false);
     let limit = req.limit.unwrap_or(100).max(0) as usize;
     let offset = req.offset.unwrap_or(0).max(0) as usize;
     let max_height = qp.max_block.map(|h| h as u32);
@@ -426,11 +485,12 @@ impl MinaArchive for IndexerArchive {
     }
 
     let total_count = txns.len() as i64;
-    let transactions: Vec<BlockTransaction> =
-      txns.iter().skip(offset).take(limit).map(|t| ix_search_to_block_transaction(t, include_timestamp)).collect();
-    let next_offset = offset as i64 + transactions.len() as i64;
-    Ok(SearchTransactionsResponse {
-      transactions,
+    let commands: Vec<ArchiveSearchCommand> = txns.iter().skip(offset).take(limit).map(ix_search_to_command).collect();
+    let next_offset = offset as i64 + commands.len() as i64;
+    Ok(ArchiveTransactionPage {
+      commands,
+      // The indexer's search covers user commands only.
+      zkapp_commands: Vec::new(),
       total_count,
       next_offset: if next_offset < total_count { Some(next_offset) } else { None },
     })
@@ -772,33 +832,33 @@ impl MinaArchive for PostgresArchive {
   async fn search_transactions(
     &self,
     req: &SearchTransactionsRequest,
-  ) -> Result<SearchTransactionsResponse, MinaMeshError> {
+  ) -> Result<ArchiveTransactionPage, MinaMeshError> {
     let original_offset = req.offset.unwrap_or(0);
     let mut offset = original_offset;
     let mut limit = req.limit.unwrap_or(100);
-    let mut transactions = Vec::new();
+    let mut commands: Vec<ArchiveSearchCommand> = Vec::new();
+    let mut zkapp_rows: Vec<ZkAppCommand> = Vec::new();
     let mut total_count = 0;
 
     let query_params = SearchTransactionsQueryParams::try_from(req.clone())?;
-    let include_timestamp = req.include_timestamp.unwrap_or(false);
 
     // User Commands
     let user_commands = self.fetch_user_commands(&query_params, offset, limit).await?;
     let user_commands_total_count = user_commands.first().and_then(|uc| uc.total_count).unwrap_or(0);
-    let user_transactions_bt: Vec<BlockTransaction> = map_to_block_transactions(user_commands, include_timestamp);
-    transactions.extend(user_transactions_bt);
+    commands.extend(user_commands.into_iter().map(ArchiveSearchCommand::from));
     total_count += user_commands_total_count;
 
     // Internal Commands
     let mut internal_commands_bt_len = 0;
-    if limit > transactions.len() as i64 {
+    if limit > commands.len() as i64 {
       // if we are below the limit, fetch internal commands
-      (offset, limit) = adjust_limit_and_offset(limit, offset, transactions.len() as i64);
+      (offset, limit) = adjust_limit_and_offset(limit, offset, commands.len() as i64);
       let internal_commands = self.fetch_internal_commands(&query_params, offset, limit).await?;
       let internal_commands_total_count = internal_commands.first().and_then(|ic| ic.total_count).unwrap_or(0);
-      let internal_commands_bt: Vec<BlockTransaction> = map_to_block_transactions(internal_commands, include_timestamp);
+      let internal_commands_bt: Vec<ArchiveSearchCommand> =
+        internal_commands.into_iter().map(ArchiveSearchCommand::from).collect();
       internal_commands_bt_len = internal_commands_bt.len();
-      transactions.extend(internal_commands_bt);
+      commands.extend(internal_commands_bt);
       total_count += internal_commands_total_count;
     } else {
       // otherwise only fetch the first internal command to get the total count
@@ -808,13 +868,12 @@ impl MinaArchive for PostgresArchive {
     }
 
     // ZkApp Commands
-    if limit > transactions.len() as i64 {
+    if limit > commands.len() as i64 {
       // if we are below the limit, fetch zkapp commands
       (offset, limit) = adjust_limit_and_offset(limit, offset, internal_commands_bt_len as i64);
       let zkapp_commands = self.fetch_zkapp_commands(&query_params, offset, limit).await?;
       let zkapp_commands_total_count = zkapp_commands.first().and_then(|ic| ic.total_count).unwrap_or(0);
-      let zkapp_commands_bt = zkapp_commands_to_block_transactions(zkapp_commands, include_timestamp);
-      transactions.extend(zkapp_commands_bt);
+      zkapp_rows.extend(zkapp_commands);
       total_count += zkapp_commands_total_count;
     } else {
       // otherwise only fetch the first zkapp command to get the total count
@@ -823,9 +882,10 @@ impl MinaArchive for PostgresArchive {
       total_count += zkapp_commands_total_count;
     }
 
-    let next_offset = original_offset + transactions.len() as i64;
-    Ok(SearchTransactionsResponse {
-      transactions,
+    let next_offset = original_offset + commands.len() as i64 + zkapp_rows.len() as i64;
+    Ok(ArchiveTransactionPage {
+      commands,
+      zkapp_commands: zkapp_rows,
       total_count,
       next_offset: if next_offset < total_count { Some(next_offset) } else { None },
     })
@@ -943,21 +1003,6 @@ pub fn zkapp_commands_to_block_transactions(
   result
 }
 
-fn map_to_block_transactions<T>(commands: Vec<T>, include_timestamp: bool) -> Vec<BlockTransaction>
-where
-  T: Into<BlockTransaction> + HasTimestamp,
-{
-  commands
-    .into_iter()
-    .map(|cmd| {
-      let timestamp = cmd.timestamp().map(|ts| ts.parse::<i64>().unwrap_or_default());
-      let mut transaction: BlockTransaction = cmd.into();
-      transaction.timestamp = if include_timestamp { timestamp } else { None };
-      transaction
-    })
-    .collect()
-}
-
 impl From<InternalCommand> for BlockTransaction {
   fn from(internal_command: InternalCommand) -> Self {
     let transaction_identifier = generate_internal_command_transaction_identifier(
@@ -981,6 +1026,56 @@ impl From<InternalCommand> for BlockTransaction {
   }
 }
 
+impl From<UserCommand> for ArchiveSearchCommand {
+  fn from(command: UserCommand) -> Self {
+    let timestamp = command.timestamp.as_ref().and_then(|ts| ts.parse::<i64>().ok());
+    let block_identifier =
+      BlockIdentifier::new(command.height.unwrap_or_default(), command.state_hash.clone().unwrap_or_default());
+    ArchiveSearchCommand {
+      block_identifier,
+      timestamp,
+      command: ArchiveSearchCommandKind::User(UserCommandMetadata {
+        command_type: command.command_type,
+        nonce: command.nonce,
+        amount: command.amount,
+        fee: command.fee,
+        valid_until: command.valid_until,
+        memo: command.memo,
+        hash: command.hash,
+        fee_payer: command.fee_payer,
+        source: command.source,
+        receiver: command.receiver,
+        status: command.status,
+        failure_reason: command.failure_reason,
+        creation_fee: command.creation_fee,
+      }),
+    }
+  }
+}
+
+impl From<InternalCommand> for ArchiveSearchCommand {
+  fn from(command: InternalCommand) -> Self {
+    let timestamp = command.timestamp.as_ref().and_then(|ts| ts.parse::<i64>().ok());
+    let block_identifier =
+      BlockIdentifier::new(command.height.unwrap_or_default(), command.state_hash.clone().unwrap_or_default());
+    ArchiveSearchCommand {
+      block_identifier,
+      timestamp,
+      command: ArchiveSearchCommandKind::Internal(InternalCommandMetadata {
+        command_type: command.command_type,
+        receiver: command.receiver,
+        fee: command.fee,
+        hash: command.hash,
+        creation_fee: command.creation_fee,
+        sequence_no: command.sequence_no,
+        secondary_sequence_no: command.secondary_sequence_no,
+        status: command.status,
+        coinbase_receiver: command.coinbase_receiver,
+      }),
+    }
+  }
+}
+
 impl From<UserCommand> for BlockTransaction {
   fn from(user_command: UserCommand) -> Self {
     let metadata = generate_transaction_metadata(&user_command);
@@ -999,7 +1094,7 @@ impl From<UserCommand> for BlockTransaction {
 
 /// Map an indexer user-command search row into a Rosetta `BlockTransaction`, reusing the
 /// shared operation generators via `UserCommandMetadata`.
-fn ix_search_to_block_transaction(tx: &IxSearchTxn, include_timestamp: bool) -> BlockTransaction {
+fn ix_search_to_command(tx: &IxSearchTxn) -> ArchiveSearchCommand {
   let command_type =
     if tx.kind.to_uppercase().contains("DELEG") { UserCommandType::Delegation } else { UserCommandType::Payment };
   let amount = match command_type {
@@ -1021,20 +1116,13 @@ fn ix_search_to_block_transaction(tx: &IxSearchTxn, include_timestamp: bool) -> 
     failure_reason: tx.failure_reason.clone(),
     creation_fee: tx.receiver_account_creation_fee_paid.then(|| ACCOUNT_CREATION_FEE.to_string()),
   };
-  let transaction = Transaction {
-    transaction_identifier: Box::new(TransactionIdentifier::new(tx.hash.clone())),
-    operations: generate_operations_user_command(&meta),
-    metadata: generate_transaction_metadata(&meta),
-    related_transactions: None,
-  };
-  let block_identifier = BlockIdentifier::new(tx.block_height as i64, tx.block.state_hash.clone());
-  let mut bt = BlockTransaction::new(block_identifier, transaction);
-  // The indexer exposes ISO datetimes, not epoch millis, so per-result timestamps aren't
-  // available here (Rosetta wants i64 millis). include_timestamp callers get None.
-  if include_timestamp {
-    bt.timestamp = tx.block.date_time.parse::<i64>().ok();
+  ArchiveSearchCommand {
+    block_identifier: BlockIdentifier::new(tx.block_height as i64, tx.block.state_hash.clone()),
+    // The indexer exposes ISO datetimes, not the epoch millis Rosetta wants, so this parses
+    // only when the value happens to be numeric.
+    timestamp: tx.block.date_time.parse::<i64>().ok(),
+    command: ArchiveSearchCommandKind::User(meta),
   }
-  bt
 }
 
 pub struct SearchTransactionsQueryParams {
@@ -1226,5 +1314,91 @@ mod balance_assembly_tests {
     let response: AccountBalanceResponse =
       balance(Some("wTYTc38ab19XT4oPPv7pajgGEUWWXc5AzDKvqqCNiFBfLCCnXK"), 5, 5, 0).into();
     assert_ne!(response.balances[0].currency.symbol, "MINA");
+  }
+}
+
+#[cfg(test)]
+mod search_assembly_tests {
+  use coinbase_mesh::models::BlockIdentifier;
+
+  use super::{ArchiveSearchCommand, ArchiveSearchCommandKind, ArchiveTransactionPage};
+  use crate::{InternalCommandMetadata, InternalCommandType, TransactionStatus, UserCommandMetadata, UserCommandType};
+
+  fn user_hit(hash: &str, timestamp: Option<i64>) -> ArchiveSearchCommand {
+    ArchiveSearchCommand {
+      block_identifier: BlockIdentifier::new(42, "3NLa".to_string()),
+      timestamp,
+      command: ArchiveSearchCommandKind::User(UserCommandMetadata {
+        command_type: UserCommandType::Payment,
+        nonce: 1,
+        amount: Some("2000000000".to_string()),
+        fee: Some("100000000".to_string()),
+        valid_until: None,
+        memo: None,
+        hash: hash.to_string(),
+        fee_payer: "B62qsender".to_string(),
+        source: "B62qsender".to_string(),
+        receiver: "B62qreceiver".to_string(),
+        status: TransactionStatus::Applied,
+        failure_reason: None,
+        creation_fee: None,
+      }),
+    }
+  }
+
+  fn internal_hit() -> ArchiveSearchCommand {
+    ArchiveSearchCommand {
+      block_identifier: BlockIdentifier::new(42, "3NLa".to_string()),
+      timestamp: Some(1_700_000_000_000),
+      command: ArchiveSearchCommandKind::Internal(InternalCommandMetadata {
+        command_type: InternalCommandType::Coinbase,
+        receiver: "B62qproducer".to_string(),
+        fee: Some("720000000000".to_string()),
+        hash: "3NLa".to_string(),
+        creation_fee: None,
+        sequence_no: 0,
+        secondary_sequence_no: 0,
+        status: TransactionStatus::Applied,
+        coinbase_receiver: None,
+      }),
+    }
+  }
+
+  fn page(commands: Vec<ArchiveSearchCommand>) -> ArchiveTransactionPage {
+    ArchiveTransactionPage { commands, zkapp_commands: Vec::new(), total_count: 7, next_offset: Some(2) }
+  }
+
+  #[test]
+  fn hits_become_block_transactions_carrying_their_block() {
+    let response = page(vec![user_hit("5Jtx", None), internal_hit()]).into_response(false);
+    assert_eq!(response.transactions.len(), 2);
+    assert!(response.transactions.iter().all(|bt| bt.block_identifier.index == 42));
+    assert_eq!(response.transactions[0].transaction.transaction_identifier.hash, "5Jtx");
+    // Internal commands get a synthesized identifier, not a bare hash.
+    assert!(response.transactions[1].transaction.transaction_identifier.hash.starts_with("coinbase:"));
+  }
+
+  // include_timestamp is a property of the request, so it is applied here rather than by each
+  // adapter -- which is the point of moving assembly above the trait.
+  #[test]
+  fn timestamps_appear_only_when_the_request_asked_for_them() {
+    let with = page(vec![user_hit("5Jtx", Some(1_700_000_000_000))]).into_response(true);
+    assert_eq!(with.transactions[0].timestamp, Some(1_700_000_000_000));
+
+    let without = page(vec![user_hit("5Jtx", Some(1_700_000_000_000))]).into_response(false);
+    assert_eq!(without.transactions[0].timestamp, None);
+  }
+
+  #[test]
+  fn a_hit_with_no_timestamp_stays_none_even_when_requested() {
+    let response = page(vec![user_hit("5Jtx", None)]).into_response(true);
+    assert_eq!(response.transactions[0].timestamp, None);
+  }
+
+  #[test]
+  fn paging_fields_pass_through() {
+    let response = page(vec![user_hit("5Jtx", None)]).into_response(false);
+    assert_eq!(response.total_count, 7);
+    assert_eq!(response.next_offset, Some(2));
   }
 }
