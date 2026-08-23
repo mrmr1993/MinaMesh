@@ -191,6 +191,22 @@ impl ArchiveTransactionPage {
   }
 }
 
+/// Whether a payment is already on chain.
+///
+/// Not a boolean, because the third answer is real and both collapses of it are harmful. Reading
+/// "I cannot tell" as *applied* refuses a legitimate resubmit of a payment that was orphaned;
+/// reading it as *absent* invites a duplicate submission. A full-history archive never returns
+/// [`PaymentHistory::Unknown`]; one that can only search part of the chain does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaymentHistory {
+  /// Found on the chain that survived.
+  Applied,
+  /// Certainly not applied.
+  Absent,
+  /// Cannot be determined from what this archive can search.
+  Unknown,
+}
+
 #[async_trait]
 pub trait MinaArchive: Send + Sync {
   /// How the caller knows these history responses are true. `Verified` for the SNARK-gated
@@ -226,7 +242,7 @@ pub trait MinaArchive: Send + Sync {
   async fn account_nonce(&self, public_key: &str) -> Result<Option<u32>, MinaMeshError>;
 
   /// Whether an exact-match `payment` already exists in history (submit duplicate detection).
-  async fn payment_in_history(&self, payment: &Payment) -> Result<bool, MinaMeshError>;
+  async fn payment_in_history(&self, payment: &Payment) -> Result<PaymentHistory, MinaMeshError>;
 }
 
 // ===========================================================================================
@@ -500,18 +516,30 @@ impl MinaArchive for IndexerArchive {
     self.client.account_nonce(public_key).await
   }
 
-  async fn payment_in_history(&self, payment: &Payment) -> Result<bool, MinaMeshError> {
+  async fn payment_in_history(&self, payment: &Payment) -> Result<PaymentHistory, MinaMeshError> {
     let sender = &payment.from;
     let receiver = &payment.to;
     let nonce = payment.nonce as i64;
     // Scan the sender's recent commands for an exact duplicate.
-    let txns = self.client.account_transactions(sender, true, None, 200).await?;
-    Ok(txns.iter().any(|t| {
+    const SCAN: usize = 200;
+    let txns = self.client.account_transactions(sender, true, None, SCAN).await?;
+    let found = txns.iter().any(|t| {
       t.nonce as i64 == nonce
         && t.amount == payment.amount
         && t.fee == payment.fee
         && t.to.as_deref() == Some(receiver.as_str())
-    }))
+    });
+    if found {
+      return Ok(PaymentHistory::Applied);
+    }
+    // The scan is bounded, so a full page means older commands were not looked at and this
+    // payment could be among them. Reporting `Absent` there is a false negative, and a false
+    // negative here is a duplicate submission. Paging to completion would let this answer
+    // properly.
+    if txns.len() >= SCAN {
+      return Ok(PaymentHistory::Unknown);
+    }
+    Ok(PaymentHistory::Absent)
   }
 }
 
@@ -900,7 +928,7 @@ impl MinaArchive for PostgresArchive {
     ))
   }
 
-  async fn payment_in_history(&self, payment: &Payment) -> Result<bool, MinaMeshError> {
+  async fn payment_in_history(&self, payment: &Payment) -> Result<PaymentHistory, MinaMeshError> {
     let sender = &payment.from;
     let receiver = &payment.to;
     let nonce = payment.nonce as i64;
@@ -909,7 +937,8 @@ impl MinaArchive for PostgresArchive {
     let row = sqlx::query_file!("sql/queries/query_payment.sql", nonce, sender, receiver, amount, fee)
       .fetch_optional(&self.pool)
       .await?;
-    Ok(row.is_some())
+    // A full-history archive can rule a payment out, so there is no `Unknown` case here.
+    Ok(if row.is_some() { PaymentHistory::Applied } else { PaymentHistory::Absent })
   }
 }
 

@@ -2,7 +2,9 @@ use anyhow::Result;
 use coinbase_mesh::models::{ConstructionSubmitRequest, TransactionIdentifier, TransactionIdentifierResponse};
 use mina_p2p_messages::binprot::BinProtWrite;
 
-use crate::{MinaMesh, MinaMeshError, Payment, Provenance, SignedDelegation, SignedPayment, TransactionSigned};
+use crate::{
+  MinaMesh, MinaMeshError, Payment, PaymentHistory, Provenance, SignedDelegation, SignedPayment, TransactionSigned,
+};
 
 /// https://github.com/MinaProtocol/mina/blob/985eda49bdfabc046ef9001d3c406e688bc7ec45/src/app/rosetta/lib/construction.ml#L849
 impl MinaMesh {
@@ -87,6 +89,10 @@ impl MinaMesh {
   async fn is_transaction_in_db(&self, payment: Payment) -> Result<bool, MinaMeshError> {
     // Duplicate detection is a history-axis read: the indexer scans the sender's recent
     // commands, the Postgres archive matches the exact payment row. Both live behind `MinaArchive`.
-    self.archive.payment_in_history(&payment).await
+    //
+    // Only a definite `Applied` refines the error into a duplicate. `Unknown` defers to the node,
+    // which rejects a spent nonce anyway — claiming a duplicate on a guess would refuse a
+    // legitimate resubmit of a payment that was orphaned.
+    Ok(self.archive.payment_in_history(&payment).await? == PaymentHistory::Applied)
   }
 }

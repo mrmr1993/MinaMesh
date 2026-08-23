@@ -29,8 +29,8 @@ use serde_json::json;
 
 use crate::{
   ArchiveAccountBalance, ArchiveBlock, ArchiveTip, ArchiveTransactionPage, InternalCommandMetadata,
-  InternalCommandType, MinaArchive, MinaMeshError, Payment, Provenance, TransactionStatus, UserCommandMetadata,
-  UserCommandType,
+  InternalCommandType, MinaArchive, MinaMeshError, Payment, PaymentHistory, Provenance, TransactionStatus,
+  UserCommandMetadata, UserCommandType,
 };
 
 /// HTTP GraphQL client for a running `Archive-Node-API` server.
@@ -317,11 +317,11 @@ impl MinaArchive for ArchiveNodeApiArchive {
     ))
   }
 
-  async fn payment_in_history(&self, _payment: &Payment) -> Result<bool, MinaMeshError> {
+  async fn payment_in_history(&self, _payment: &Payment) -> Result<PaymentHistory, MinaMeshError> {
     // No tx-by-hash / account search on this backend, so an exact-duplicate check isn't
-    // possible. Report "not found": a genuine duplicate then surfaces as a bad-nonce submit
-    // error rather than the more specific duplicate error (this path is best-effort refinement).
-    Ok(false)
+    // possible. This used to report "not found", which is a false negative dressed as an
+    // answer; `Unknown` says the same thing without asserting the payment is new.
+    Ok(PaymentHistory::Unknown)
   }
 }
 
