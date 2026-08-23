@@ -24,7 +24,9 @@ impl MinaMesh {
         ],
         operation_types: operation_types(),
         errors,
-        historical_balance_lookup: true,
+        // Declared by the archive rather than hardcoded: a backend that cannot answer for an
+        // account which has not moved recently must not promise that it can.
+        historical_balance_lookup: self.archive.historical_balance_lookup(),
         timestamp_start_index: None,
         call_methods: vec![],
         balance_exemptions: vec![],

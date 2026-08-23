@@ -95,37 +95,70 @@ impl From<ArchiveBlock> for BlockResponse {
 /// An account's balance at a historical block, as the history axis knows it. Adapters report
 /// the numbers; how they are expressed as a Rosetta `AccountBalanceResponse` is decided once,
 /// above the trait.
+///
+/// Adapters return `Option<ArchiveAccountBalance>`: `None` says the account does not exist at
+/// that block, which is a real answer a full-history archive can give. It is *not* the same as
+/// being unable to see the account, which an archive holding a window of history can hit and
+/// which is [`MinaMeshError::AccountNotVisible`]. Collapsing the two -- reporting a zero balance
+/// because nothing was found -- tells a caller an account is empty when the truth may be that it
+/// is merely older than the blocks held.
 #[derive(Debug, Clone)]
-pub struct ArchiveAccountBalance {
-  pub block_identifier: BlockIdentifier,
-  /// The token the balance is denominated in, or `None` when the account was not found at that
-  /// block -- the response then reports a default-token zero balance.
-  pub token_id: Option<String>,
-  pub total_balance: u64,
-  pub liquid_balance: u64,
-  pub locked_balance: u64,
-  pub nonce: u64,
+pub enum ArchiveAccountBalance {
+  Found {
+    block_identifier: BlockIdentifier,
+    /// The token the balance is denominated in. Always known for an account that exists; the
+    /// case where it was not is now [`ArchiveAccountBalance::Absent`].
+    token_id: String,
+    total_balance: u64,
+    liquid_balance: u64,
+    locked_balance: u64,
+    nonce: u64,
+  },
+  /// The account does not exist at that block. Rosetta expresses this as a zero balance, but
+  /// only an adapter that can see the whole history may say it.
+  Absent { block_identifier: BlockIdentifier },
 }
 
 impl From<ArchiveAccountBalance> for AccountBalanceResponse {
   fn from(balance: ArchiveAccountBalance) -> Self {
-    AccountBalanceResponse {
-      block_identifier: Box::new(balance.block_identifier),
-      balances: vec![Amount {
-        currency: Box::new(create_currency(balance.token_id.as_ref())),
-        // Rosetta's `value` is the spendable balance; the locked/liquid/total split rides in
-        // metadata, as it has since the OCaml implementation.
-        value: balance.liquid_balance.to_string(),
+    match balance {
+      ArchiveAccountBalance::Found {
+        block_identifier,
+        token_id,
+        total_balance,
+        liquid_balance,
+        locked_balance,
+        nonce,
+      } => AccountBalanceResponse {
+        block_identifier: Box::new(block_identifier),
+        balances: vec![Amount {
+          currency: Box::new(create_currency(Some(&token_id))),
+          // Rosetta's `value` is the spendable balance; the locked/liquid/total split rides in
+          // metadata, as it has since the OCaml implementation.
+          value: liquid_balance.to_string(),
+          metadata: Some(json!({
+            "locked_balance": locked_balance,
+            "liquid_balance": liquid_balance,
+            "total_balance": total_balance
+          })),
+        }],
         metadata: Some(json!({
-          "locked_balance": balance.locked_balance,
-          "liquid_balance": balance.liquid_balance,
-          "total_balance": balance.total_balance
+          "created_via_historical_lookup": true,
+          "nonce": nonce.to_string()
         })),
-      }],
-      metadata: Some(json!({
-        "created_via_historical_lookup": true,
-        "nonce": balance.nonce.to_string()
-      })),
+      },
+      // Byte-for-byte what the previous not-found path produced: an absent account is still
+      // reported as a zero balance in the default token, with the same metadata shape. Only the
+      // adapters' obligation changed, not the response.
+      ArchiveAccountBalance::Absent { block_identifier } => AccountBalanceResponse {
+        block_identifier: Box::new(block_identifier),
+        balances: vec![Amount {
+          currency: Box::new(create_currency(None)),
+          value: "0".to_string(),
+          metadata: Some(json!({ "locked_balance": 0, "liquid_balance": 0, "total_balance": 0 })),
+        }],
+        metadata: Some(json!({ "created_via_historical_lookup": true, "nonce": "0" })),
+      },
     }
   }
 }
@@ -195,15 +228,17 @@ impl ArchiveTransactionPage {
 ///
 /// Not a boolean, because the third answer is real and both collapses of it are harmful. Reading
 /// "I cannot tell" as *applied* refuses a legitimate resubmit of a payment that was orphaned;
-/// reading it as *absent* invites a duplicate submission. A full-history archive never returns
-/// [`PaymentHistory::Unknown`]; one that can only search part of the chain does.
+/// reading it as *absent* invites a double spend. A full-history archive never returns
+/// [`PaymentHistory::Unknown`]; one holding a window does whenever the payment would predate the
+/// blocks it holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaymentHistory {
   /// Found on the chain that survived.
   Applied,
-  /// Certainly not applied.
+  /// Certainly not applied. A windowed archive may still say this when the sender's nonce has
+  /// not reached the payment's, which rules it out without needing to see the blocks.
   Absent,
-  /// Cannot be determined from what this archive can search.
+  /// Cannot be determined from what this archive holds.
   Unknown,
 }
 
@@ -231,6 +266,17 @@ pub trait MinaArchive: Send + Sync {
     metadata: Option<Value>,
     partial: &PartialBlockIdentifier,
   ) -> Result<ArchiveAccountBalance, MinaMeshError>;
+
+  /// Whether `/account/balance` can be answered for *any* account at a block in range, which is
+  /// what `Allow.historical_balance_lookup` promises a client.
+  ///
+  /// A full-history archive can, so this defaults to true. An archive holding a window of blocks
+  /// cannot without a ledger snapshot at its floor: a block records only the accounts it
+  /// touched, so one that has not moved recently is invisible even though the block the client
+  /// asked about is in range.
+  fn historical_balance_lookup(&self) -> bool {
+    true
+  }
 
   /// Search historical transactions. Rosetta assembly, and the request's `include_timestamp`,
   /// are applied once by [`ArchiveTransactionPage::into_response`].
@@ -437,22 +483,17 @@ impl MinaArchive for IndexerArchive {
     let block = self.resolve_block(partial).await?;
     let block_identifier = BlockIdentifier { hash: block.state_hash.clone(), index: block.block_height as i64 };
     match self.client.staged_account(public_key, block.block_height, None).await? {
-      Some(acct) => Ok(ArchiveAccountBalance {
+      Some(acct) => Ok(ArchiveAccountBalance::Found {
         block_identifier,
-        token_id: Some(token_id),
+        token_id,
         total_balance: acct.balance_nano,
         liquid_balance: acct.balance_nano,
         locked_balance: 0,
         nonce: acct.nonce as u64,
       }),
-      None => Ok(ArchiveAccountBalance {
-        block_identifier,
-        token_id: None,
-        total_balance: 0,
-        liquid_balance: 0,
-        locked_balance: 0,
-        nonce: 0,
-      }),
+      // The indexer holds the staged ledger at that block, so not finding the account means it
+      // does not exist there.
+      None => Ok(ArchiveAccountBalance::Absent { block_identifier }),
     }
   }
 
@@ -533,9 +574,8 @@ impl MinaArchive for IndexerArchive {
       return Ok(PaymentHistory::Applied);
     }
     // The scan is bounded, so a full page means older commands were not looked at and this
-    // payment could be among them. Reporting `Absent` there is a false negative, and a false
-    // negative here is a duplicate submission. Paging to completion would let this answer
-    // properly.
+    // payment could be among them. Saying `Absent` there is a false negative, and a false
+    // negative here is a duplicate submission.
     if txns.len() >= SCAN {
       return Ok(PaymentHistory::Unknown);
     }
@@ -813,13 +853,9 @@ impl MinaArchive for PostgresArchive {
     .fetch_optional(&self.pool)
     .await?;
     match maybe_account_balance_info {
-      None => Ok(ArchiveAccountBalance {
+      // The archive holds all history, so no row means the account does not exist at that block.
+      None => Ok(ArchiveAccountBalance::Absent {
         block_identifier: build_block_identifier(block.height, block.state_hash, index, hash)?,
-        token_id: None,
-        total_balance: 0,
-        liquid_balance: 0,
-        locked_balance: 0,
-        nonce: 0,
       }),
       Some(account_balance_info) => {
         let token_id = account_balance_info.token_id;
@@ -845,9 +881,9 @@ impl MinaArchive for PostgresArchive {
         };
         let total_balance = last_relevant_command_balance;
         let locked_balance = total_balance - liquid_balance;
-        Ok(ArchiveAccountBalance {
+        Ok(ArchiveAccountBalance::Found {
           block_identifier: build_block_identifier(block.height, block.state_hash, index, hash)?,
-          token_id: Some(token_id),
+          token_id,
           total_balance,
           liquid_balance,
           locked_balance,
@@ -1295,10 +1331,10 @@ mod balance_assembly_tests {
   use super::ArchiveAccountBalance;
   use crate::util::DEFAULT_TOKEN_ID;
 
-  fn balance(token_id: Option<&str>, total: u64, liquid: u64, locked: u64) -> ArchiveAccountBalance {
-    ArchiveAccountBalance {
+  fn balance(token_id: &str, total: u64, liquid: u64, locked: u64) -> ArchiveAccountBalance {
+    ArchiveAccountBalance::Found {
       block_identifier: BlockIdentifier::new(42, "3NLa".to_string()),
-      token_id: token_id.map(str::to_string),
+      token_id: token_id.to_string(),
       total_balance: total,
       liquid_balance: liquid,
       locked_balance: locked,
@@ -1306,10 +1342,30 @@ mod balance_assembly_tests {
     }
   }
 
+  /// An account that does not exist reports zero, which is what Rosetta expects — but it is now
+  /// a case an adapter has to choose, not the fallback for anything it failed to find.
+  ///
+  /// The response must be exactly what the previous not-found path produced, including the
+  /// metadata: this change is about what an adapter is allowed to claim, not about the wire.
+  #[test]
+  fn an_absent_account_reports_zero_exactly_as_before() {
+    let response: AccountBalanceResponse =
+      ArchiveAccountBalance::Absent { block_identifier: BlockIdentifier::new(42, "3NLa".to_string()) }.into();
+    let amount = &response.balances[0];
+    assert_eq!(amount.value, "0");
+    assert_eq!(amount.currency.symbol, "MINA");
+    let metadata = amount.metadata.as_ref().expect("the split metadata is part of the response");
+    assert_eq!(metadata["total_balance"], 0);
+    assert_eq!(metadata["liquid_balance"], 0);
+    assert_eq!(metadata["locked_balance"], 0);
+    assert_eq!(response.metadata.as_ref().unwrap()["nonce"], "0");
+    assert_eq!(response.metadata.as_ref().unwrap()["created_via_historical_lookup"], true);
+  }
+
   // Rosetta's `value` is the spendable balance; the split rides in metadata.
   #[test]
   fn value_is_the_liquid_balance_and_the_split_is_metadata() {
-    let response: AccountBalanceResponse = balance(Some(DEFAULT_TOKEN_ID), 1000, 600, 400).into();
+    let response: AccountBalanceResponse = balance(DEFAULT_TOKEN_ID, 1000, 600, 400).into();
     let amount = &response.balances[0];
     assert_eq!(amount.value, "600");
     let metadata = amount.metadata.as_ref().unwrap();
@@ -1320,7 +1376,7 @@ mod balance_assembly_tests {
 
   #[test]
   fn the_nonce_and_block_are_carried_through() {
-    let response: AccountBalanceResponse = balance(Some(DEFAULT_TOKEN_ID), 1, 1, 0).into();
+    let response: AccountBalanceResponse = balance(DEFAULT_TOKEN_ID, 1, 1, 0).into();
     assert_eq!(response.block_identifier.index, 42);
     assert_eq!(response.block_identifier.hash, "3NLa");
     let metadata = response.metadata.as_ref().unwrap();
@@ -1331,17 +1387,9 @@ mod balance_assembly_tests {
   // An account absent at that block reports a default-token zero rather than naming a token it
   // was never found holding.
   #[test]
-  fn an_absent_account_reports_a_default_token_zero() {
-    let response: AccountBalanceResponse = balance(None, 0, 0, 0).into();
-    let amount = &response.balances[0];
-    assert_eq!(amount.value, "0");
-    assert_eq!(amount.currency.symbol, "MINA");
-  }
-
-  #[test]
   fn a_custom_token_is_named_in_the_currency() {
     let response: AccountBalanceResponse =
-      balance(Some("wTYTc38ab19XT4oPPv7pajgGEUWWXc5AzDKvqqCNiFBfLCCnXK"), 5, 5, 0).into();
+      balance("wTYTc38ab19XT4oPPv7pajgGEUWWXc5AzDKvqqCNiFBfLCCnXK", 5, 5, 0).into();
     assert_ne!(response.balances[0].currency.symbol, "MINA");
   }
 }
